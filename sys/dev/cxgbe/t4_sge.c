@@ -1987,6 +1987,22 @@ set_mbuf_len16(struct mbuf *m, uint8_t len16)
 }
 
 static inline int
+mbuf_nomap(struct mbuf *m)
+{
+
+	M_ASSERTPKTHDR(m);
+	return (m->m_pkthdr.PH_loc.eight[1]);
+}
+
+static inline void
+set_mbuf_nomap(struct mbuf *m, uint8_t nomap)
+{
+
+	M_ASSERTPKTHDR(m);
+	m->m_pkthdr.PH_loc.eight[1] = nomap;
+}
+
+static inline int
 needs_tso(struct mbuf *m)
 {
 
@@ -2228,6 +2244,7 @@ restart:
 		goto restart;
 	}
 	set_mbuf_nsegs(m0, nsegs);
+	set_mbuf_nomap(m0, ext_pgs);
 	if (sc->flags & IS_VF)
 		set_mbuf_len16(m0, txpkt_vm_len16(nsegs, needs_tso(m0)));
 	else
@@ -4085,16 +4102,12 @@ txpkts1_len16(void)
 static inline u_int
 imm_payload(u_int ndesc)
 {
-#if 0 /* XXX what about M_UNMAPPED */
 	u_int n;
 
 	n = ndesc * EQ_ESIZE - sizeof(struct fw_eth_tx_pkt_wr) -
 	    sizeof(struct cpl_tx_pkt_core);
 
 	return (n);
-#else
-	return (0);
-#endif
 }
 
 /*
@@ -4305,7 +4318,8 @@ write_txpkt_wr(struct sge_txq *txq, struct fw_eth_tx_pkt_wr *wr,
 	ctrl = sizeof(struct cpl_tx_pkt_core);
 	if (needs_tso(m0))
 		ctrl += sizeof(struct cpl_tx_pkt_lso_core);
-	else if (pktlen <= imm_payload(2) && available >= 2) {
+	else if (mbuf_nomap(m0) == 0 && pktlen <= imm_payload(2) &&
+	    available >= 2) {
 		/* Immediate data.  Recalculate len16 and set nsegs to 0. */
 		ctrl += pktlen;
 		len16 = howmany(sizeof(struct fw_eth_tx_pkt_wr) +
