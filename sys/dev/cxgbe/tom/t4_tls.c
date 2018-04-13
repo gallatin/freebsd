@@ -1631,14 +1631,38 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 	return (0);
 }
 
+static struct protosw *tcp_protosw;
+
 static int
 t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 {
+	struct vi_info *vi;
+	struct ifnet *ifp;
+	struct rtentry *rte;
+	struct inpcb *inp;
 
 	/*
 	 * Perform routing lookup to find ifnet.  Reject if it is not
 	 * on a T6 or on a T6 that doesn't support TLS.
+	 *
+	 * XXX: Only IPv4 currently.
 	 */
+	if (so->so_proto != tcp_protosw)
+		return (EPROTONOSUPPORT);
+	inp = so->so_pcb;
+	rte = inp->inp_route.ro_rt;
+	if (rte == NULL || rte->rte_ifp == NULL)
+		return (ENXIO);
+
+	/* XXX: Gross */
+	ifp = rte->rte_ifp;
+	if (ifp->if_init != cxgbe_init)
+		return (ENXIO);
+	vi = ifp->if_softc;
+	if (!can_tls_offload(vi->pi->adapter))
+		return (ENXIO);
+
+	if_printf(ifp, "Found an off-loadable socket\n");
 
 	/* allocate TLS key space */
 	/* reserve TID and initialize PCB? */
@@ -1677,6 +1701,7 @@ t4_tls_mod_load(void)
 	mtx_init(&tls_handshake_lock, "t4tls handshake", NULL, MTX_DEF);
 	t4_register_cpl_handler(CPL_TLS_DATA, do_tls_data);
 	t4_register_cpl_handler(CPL_RX_TLS_CMP, do_rx_tls_cmp);
+	tcp_protosw = pffindproto(PF_INET, IPPROTO_TCP, SOCK_STREAM);
 	if (sbtls_crypto_backend_register(&t6tls_backend) != 0)
 		printf("Failed to register Chelsio T6 SBTLS backend\n");
 }
