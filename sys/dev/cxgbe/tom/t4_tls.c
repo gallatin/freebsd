@@ -28,12 +28,14 @@
  */
 
 #include "opt_inet.h"
+#include "opt_kern_tls.h"
 
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/sglist.h>
+#include <sys/sockbuf_tls.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/systm.h>
@@ -1629,6 +1631,45 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 	return (0);
 }
 
+static int
+t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
+{
+
+	/*
+	 * Perform routing lookup to find ifnet.  Reject if it is not
+	 * on a T6 or on a T6 that doesn't support TLS.
+	 */
+
+	/* allocate TLS key space */
+	/* reserve TID and initialize PCB? */
+	/* sbtls_init_sb_tls() */
+	/* set SB_TLS_IFNET */
+
+	return (EOPNOTSUPP);
+}
+
+static void
+t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
+{
+	/* program TLS keys */
+}
+
+static void
+t6_sbtls_clean_cipher(struct sbtls_info *tls, void *cipher)
+{
+	/* release TLS key space */
+	/* release TID and PCB */
+}
+
+struct sbtls_crypto_backend t6tls_backend = {
+	.name = "Chelsio T6",
+	.prio = 30,
+	.api_version = SBTLS_API_VERSION,
+	.try = t6_sbtls_try,
+	.setup_cipher = t6_sbtls_setup_cipher,
+	.clean_cipher = t6_sbtls_clean_cipher
+};
+	
 void
 t4_tls_mod_load(void)
 {
@@ -1636,12 +1677,15 @@ t4_tls_mod_load(void)
 	mtx_init(&tls_handshake_lock, "t4tls handshake", NULL, MTX_DEF);
 	t4_register_cpl_handler(CPL_TLS_DATA, do_tls_data);
 	t4_register_cpl_handler(CPL_RX_TLS_CMP, do_rx_tls_cmp);
+	if (sbtls_crypto_backend_register(&t6tls_backend) != 0)
+		printf("Failed to register Chelsio T6 SBTLS backend\n");
 }
 
 void
 t4_tls_mod_unload(void)
 {
 
+	sbtls_crypto_backend_deregister(&t6tls_backend);
 	t4_register_cpl_handler(CPL_TLS_DATA, NULL);
 	t4_register_cpl_handler(CPL_RX_TLS_CMP, NULL);
 	mtx_destroy(&tls_handshake_lock);
