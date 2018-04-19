@@ -451,7 +451,7 @@ tls_free_kmap(struct tom_data *td)
 }
 
 static int
-get_new_keyid(struct toepcb *toep, struct tls_key_context *k_ctx)
+get_new_keyid(struct toepcb *toep)
 {
 	struct tom_data *td = toep->td;
 	vmem_addr_t addr;
@@ -522,7 +522,7 @@ tls_program_key_id(struct toepcb *toep, struct tls_key_context *k_ctx)
 
 	/* Dont initialize key for re-neg */
 	if (!G_KEY_CLR_LOC(k_ctx->l_p_key)) {
-		if ((keyid = get_new_keyid(toep, k_ctx)) < 0) {
+		if ((keyid = get_new_keyid(toep)) < 0) {
 			return (ENOSPC);
 		}
 	} else {
@@ -1633,13 +1633,73 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 
 static struct protosw *tcp_protosw;
 
+struct t6_sbtls_cipher {
+	struct toepcb *toep;
+	struct sge_txq *txq;
+};
+
 static int
 t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 {
+	struct t6_sbtls_cipher *cipher;
+	struct sbtls_info *tls;
+	struct toepcb *toep;
+	struct adapter *sc;
 	struct vi_info *vi;
 	struct ifnet *ifp;
 	struct rtentry *rte;
 	struct inpcb *inp;
+	int error, keyid;
+
+	/* Sanity check values in *en. */
+	if (en->key_size != en->crypt_key_len)
+		return (EINVAL);
+	switch (en->crypt_algorithm) {
+	case CRYPTO_AES_CBC:
+		if (en->iv_len != AES_BLOCK_LEN)
+			return (EINVAL);
+		switch (en->key_size) {
+		case 128 / 8:
+		case 192 / 8:
+		case 256 / 8:
+			break;
+		default:
+			return (EINVAL);
+		}
+		switch (en->mac_algorthim) {
+		case CRYPTO_SHA1_HMAC:
+		case CRYPTO_SHA2_256_HMAC:
+		case CRYPTO_SHA2_384_HMAC:
+		case CRYPTO_SHA2_512_HMAC:
+			break;
+		default:
+			return (EPROTONOSUPPORT);
+		}
+	case CRYPTO_AES_NIST_GCM_16:
+		if (en->iv_len != 12)
+			return (EINVAL);
+		switch (en->key_size) {
+		case 128 / 8:
+			if (en->mac_algorthim != CRYPTO_AES_128_NIST_GMAC)
+				return (EINVAL);
+			break;
+		case 192 / 8:
+			if (en->mac_algorthim != CRYPTO_AES_192_NIST_GMAC)
+				return (EINVAL);
+			break;
+		case 256 / 8:
+			if (en->mac_algorthim != CRYPTO_AES_256_NIST_GMAC)
+				return (EINVAL);
+			break;
+		default:
+			return (EINVAL);
+		}
+	default:
+		return (EPROTONOSUPPORT);
+	}
+	if (!(en->tls_vmajor == 1 &&
+	    (en->tls_vminor == 1 || en->tls_vminor == 2)))
+		return (EPROTONOSUPPORT);
 
 	/*
 	 * Perform routing lookup to find ifnet.  Reject if it is not
@@ -1650,6 +1710,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 	if (so->so_proto != tcp_protosw)
 		return (EPROTONOSUPPORT);
 	inp = so->so_pcb;
+	INP_WLOCK_ASSERT(inp);
 	rte = inp->inp_route.ro_rt;
 	if (rte == NULL || rte->rte_ifp == NULL)
 		return (ENXIO);
@@ -1659,30 +1720,156 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 	if (ifp->if_init != cxgbe_init)
 		return (ENXIO);
 	vi = ifp->if_softc;
-	if (!can_tls_offload(vi->pi->adapter))
+	sc = vi->pi->adapter
+
+	/*
+	 * XXX: Needs more checks that TOE is enabled (tod is valid) and
+	 * that custom config file with KTLS settings has been loaded.
+	 *
+	 * XXX: Also need to disable "normal" TOE offloads when KTLS
+	 * config file has been loaded.
+	 */
+	if (!can_tls_offload(sc))
 		return (ENXIO);
 
-	if_printf(ifp, "Found an off-loadable socket\n");
+	if_printf(ifp, "Found an off-loadable KERN_TLS socket\n");
 
-	/* allocate TLS key space */
-	/* reserve TID and initialize PCB? */
-	/* sbtls_init_sb_tls() */
-	/* set SB_TLS_IFNET */
+	toep = alloc_toepcb(vi, -1, -1, M_NOWAIT);
+	if (toep == NULL)
+		return (ENOMEM);
+	keyid = get_new_keyid(toep);
+	if (keyid < 0) {
+		error = ENOMEM;
+		goto failed;
+	}
+	tls_ofld->tx_key_addr = keyid;
 
-	return (EOPNOTSUPP);
+	/* Need to reserve ATID and do CPL_ACT_OPEN_REQ */
+	/*
+	 * Have to drop INP while waiting for reply.  This requires
+	 * fixing sbtls_crypt_tls_enable to recheck INP validity after
+	 * invoking try in loop.
+	 *
+	 * XXX: What about rm lock?  Can't sleep while that is held
+	 * either.  Yuck.
+	 */
+	/* Need to configure L2, L3, L4 */
+	/* Set CPL bypass mode in PCB */
+	/* Other PCB initialization? */
+	/* Preallocate key work request? */
+
+	tls = sbtls_init_sb_tls(so, en, sizeof(struct t6_sbtls_cipher));
+	if (tls == NULL) {
+		error = ENOMEM;
+		goto failed;
+	}
+	cipher = tls->cipher;
+	cipher->toep = toep;
+
+	/*
+	 * XXX: Set function pointer for M_TLS handler to function in this
+	 * module perhaps either overloading sb_tls_crypt or more likely
+	 * as a new member of cipher.  Probably useful to leave sb_tls_crypt
+	 * NULL to catch bugs.
+	 */
+
+	cipher->txq = &sc->sge.txq[vi->first_txq];
+	if (inp->inp_flowtype != M_HASHTYPE_NONE)
+		txq += ((inp->inp_flowid % (vi->ntxq - vi->rsrv_noflowq)) +
+		    vi->rsrv_noflowq);
+	so->so_snd.sb_tls_flags |= SB_TLS_IFNET;
+	return (0);
+
+failed:
+	free_toepcb(toep);
+	return (error);
 }
 
 static void
 t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 {
+	struct t6_sbtls_cipher *cipher = tls->cipher;
+	struct toepcb *toep = cipher->toep;
+	struct tls_ofld_info *tls_ofld = &toep->tls;
+	struct adapter *sc = td_adapter(toep->td);
+	//struct ofld_tx_sdesc *txsd;
+	int kwrlen, kctxlen, keyid, len;
+	struct wrqe *wr;
+	struct tls_key_req *kwr;
+	struct tls_keyctx *kctx;
+
 	/* program TLS keys */
+	/* INP_WLOCK_ASSERT(inp); */
+
+	kwrlen = roundup2(sizeof(*kwr), 16);
+	kctxlen = roundup2(sizeof(*kctx), 32);
+	len = kwrlen + kctxlen;
+
+#if 0
+	if (toep->txsd_avail == 0)
+		return (EAGAIN);
+
+	wr = alloc_wrqe(len, cipher->txq);
+	if (wr == NULL) {
+		free_keyid(toep, keyid);
+		return (ENOMEM);
+	}
+	kwr = wrtod(wr);
+	memset(kwr, 0, kwrlen);
+
+	kwr->wr_hi = htobe32(V_FW_WR_OP(FW_ULPTX_WR) | F_FW_WR_COMPL |
+	    F_FW_WR_ATOMIC);
+	kwr->wr_mid = htobe32(V_FW_WR_LEN16(DIV_ROUND_UP(len, 16)) |
+	    V_FW_WR_FLOWID(toep->tid));
+	kwr->protocol = get_proto_ver(k_ctx->proto_ver);
+	kwr->mfs = htons(k_ctx->frag_size);
+	kwr->reneg_to_write_rx = k_ctx->l_p_key;
+
+	/* master command */
+	kwr->cmd = htobe32(V_ULPTX_CMD(ULP_TX_MEM_WRITE) |
+	    V_T5_ULP_MEMIO_ORDER(1) | V_T5_ULP_MEMIO_IMM(1));
+	kwr->dlen = htobe32(V_ULP_MEMIO_DATA_LEN(kctxlen >> 5));
+	kwr->len16 = htobe32((toep->tid << 8) |
+	    DIV_ROUND_UP(len - sizeof(struct work_request_hdr), 16));
+	kwr->kaddr = htobe32(V_ULP_MEMIO_ADDR(keyid >> 5));
+
+	/* sub command */
+	kwr->sc_more = htobe32(V_ULPTX_CMD(ULP_TX_SC_IMM));
+	kwr->sc_len = htobe32(kctxlen);
+
+	/* XXX: This assumes that kwrlen == sizeof(*kwr). */
+	kctx = (struct tls_keyctx *)(kwr + 1);
+	memset(kctx, 0, kctxlen);
+
+	if (G_KEY_GET_LOC(k_ctx->l_p_key) == KEY_WRITE_TX) {
+		tls_ofld->tx_key_addr = keyid;
+		prepare_txkey_wr(kctx, k_ctx);
+	} else if (G_KEY_GET_LOC(k_ctx->l_p_key) == KEY_WRITE_RX) {
+		tls_ofld->rx_key_addr = keyid;
+		prepare_rxkey_wr(kctx, k_ctx);
+	}
+
+	txsd = &toep->txsd[toep->txsd_pidx];
+	txsd->tx_credits = DIV_ROUND_UP(len, 16);
+	txsd->plen = 0;
+	toep->tx_credits -= txsd->tx_credits;
+	if (__predict_false(++toep->txsd_pidx == toep->txsd_total))
+		toep->txsd_pidx = 0;
+	toep->txsd_avail--;
+#endif
+
+	t4_wrq_tx(sc, wr);
 }
 
 static void
-t6_sbtls_clean_cipher(struct sbtls_info *tls, void *cipher)
+t6_sbtls_clean_cipher(struct sbtls_info *tls, void *cipher_arg)
 {
-	/* release TLS key space */
-	/* release TID and PCB */
+	struct t6_sbtls_cipher *cipher;
+
+	cipher = cipher_arg;
+
+	/* free TID, L2/L3/L4 */
+	free_toepcb(toep);
 }
 
 struct sbtls_crypto_backend t6tls_backend = {
