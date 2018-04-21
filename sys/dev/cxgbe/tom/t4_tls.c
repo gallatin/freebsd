@@ -35,20 +35,28 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/sglist.h>
-#include <sys/sockbuf_tls.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
+#ifdef KERN_TLS
+#include <sys/protosw.h>
+#include <sys/sockbuf_tls.h>
+#endif
 #include <sys/systm.h>
 #include <netinet/in.h>
 #include <netinet/in_pcb.h>
 #include <netinet/tcp_var.h>
 #include <netinet/toecore.h>
+#ifdef KERN_TLS
+#include <opencrypto/cryptodev.h>
+#include <opencrypto/xform.h>
+#endif
 
 #ifdef TCP_OFFLOAD
 #include "common/common.h"
 #include "common/t4_tcb.h"
 #include "tom/t4_tom_l2t.h"
 #include "tom/t4_tom.h"
+#include "t4_mp_ring.h"
 
 /*
  * The TCP sequence number of a CPL_TLS_DATA mbuf is saved here while
@@ -1631,32 +1639,86 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 	return (0);
 }
 
+#ifdef KERN_TLS
 static struct protosw *tcp_protosw;
 
 struct t6_sbtls_cipher {
 	struct toepcb *toep;
 	struct sge_txq *txq;
+	struct mbuf *key_wr;
 };
 
+static void
+init_sbtls_k_ctx(struct tls_key_context *k_ctx, struct tls_so_enable *en,
+    struct sbtls_info *tls)
+{
+	int mac_key_size;
+
+	k_ctx->proto_ver = en->tls_vmajor << 8 | en->tls_vminor;
+	k_ctx->mac_secret_size = en->hmac_key_len;
+	k_ctx->cipher_secret_size = en->key_size;
+	k_ctx->tx_key_info_size = sizeof(struct tx_keyctx_hdr) +
+	    k_ctx->cipher_secret_size;
+	if (en->crypt_algorithm == CRYPTO_AES_NIST_GCM_16) {
+		k_ctx->state.auth_mode = CHSSL_GHASH;
+		k_ctx->state.enc_mode = CH_EVP_CIPH_GCM_MODE;
+		k_ctx->iv_size = 4;
+		k_ctx->mac_first = 0;
+		k_ctx->hmac_ctrl = 0;
+		k_ctx->tx_key_info_size += GMAC_BLOCK_LEN;
+	} else {
+		switch (en->mac_algorthim) {
+		case CRYPTO_SHA1_HMAC:
+			mac_key_size = roundup2(SHA1_HASH_LEN, 16);
+			k_ctx->state.auth_mode = CHSSL_SHA1;
+			break;
+		case CRYPTO_SHA2_256_HMAC:
+			mac_key_size = SHA2_256_HASH_LEN;
+			k_ctx->state.auth_mode = CHSSL_SHA256;
+			break;
+		case CRYPTO_SHA2_384_HMAC:
+			mac_key_size = SHA2_512_HASH_LEN;
+			k_ctx->state.auth_mode = CHSSL_SHA512_384;
+			break;
+		case CRYPTO_SHA2_512_HMAC:
+			mac_key_size = SHA2_512_HASH_LEN;
+			k_ctx->state.auth_mode = CHSSL_SHA512_512;
+			break;
+		}
+		k_ctx->state.enc_mode = CH_EVP_CIPH_CBC_MODE;
+		k_ctx->iv_size = 8; /* for CBC, iv is 16B, unit of 2B */
+		k_ctx->mac_first = 1;
+		k_ctx->tx_key_info_size += mac_key_size * 2;
+	}
+
+	k_ctx->iv_ctrl = 1;
+	k_ctx->iv_algo = 0;
+	k_ctx->frag_size = tls->sb_params.sb_maxlen;
+}
+
 static int
-t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
+t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 {
 	struct t6_sbtls_cipher *cipher;
 	struct sbtls_info *tls;
+	struct tls_key_context *k_ctx;
+	struct tls_ofld_info *tls_ofld;
 	struct toepcb *toep;
 	struct adapter *sc;
 	struct vi_info *vi;
 	struct ifnet *ifp;
 	struct rtentry *rte;
 	struct inpcb *inp;
-	int error, keyid;
+	int error, keyid, len, proto_ver;
 
 	/* Sanity check values in *en. */
 	if (en->key_size != en->crypt_key_len)
 		return (EINVAL);
 	switch (en->crypt_algorithm) {
+#ifdef notyet
 	case CRYPTO_AES_CBC:
-		if (en->iv_len != AES_BLOCK_LEN)
+		/* XXX: Not sure if CBC uses a 4 byte IV for TLS? */
+		if (en->iv_len != SALT_SIZE)
 			return (EINVAL);
 		switch (en->key_size) {
 		case 128 / 8:
@@ -1675,8 +1737,9 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 		default:
 			return (EPROTONOSUPPORT);
 		}
+#endif
 	case CRYPTO_AES_NIST_GCM_16:
-		if (en->iv_len != 12)
+		if (en->iv_len != SALT_SIZE)
 			return (EINVAL);
 		switch (en->key_size) {
 		case 128 / 8:
@@ -1697,8 +1760,8 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 	default:
 		return (EPROTONOSUPPORT);
 	}
-	if (!(en->tls_vmajor == 1 &&
-	    (en->tls_vminor == 1 || en->tls_vminor == 2)))
+	proto_ver = en->tls_vmajor << 8 | en->tls_vminor;
+	if (get_proto_ver(proto_ver) > DTLS_1_2_VERSION)
 		return (EPROTONOSUPPORT);
 
 	/*
@@ -1712,15 +1775,15 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 	inp = so->so_pcb;
 	INP_WLOCK_ASSERT(inp);
 	rte = inp->inp_route.ro_rt;
-	if (rte == NULL || rte->rte_ifp == NULL)
+	if (rte == NULL || rte->rt_ifp == NULL)
 		return (ENXIO);
 
 	/* XXX: Gross */
-	ifp = rte->rte_ifp;
-	if (ifp->if_init != cxgbe_init)
+	ifp = rte->rt_ifp;
+	if (ifp->if_get_counter != cxgbe_get_counter)
 		return (ENXIO);
 	vi = ifp->if_softc;
-	sc = vi->pi->adapter
+	sc = vi->pi->adapter;
 
 	/*
 	 * XXX: Needs more checks that TOE is enabled (tod is valid) and
@@ -1742,7 +1805,46 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 		error = ENOMEM;
 		goto failed;
 	}
+	tls_ofld = &toep->tls;
 	tls_ofld->tx_key_addr = keyid;
+
+	k_ctx = &tls_ofld->k_ctx;
+	init_sbtls_k_ctx(k_ctx, en, tls);
+
+	tls_ofld->scmd0.seqno_numivs =
+		(V_SCMD_SEQ_NO_CTRL(3) |
+		 V_SCMD_PROTO_VERSION(get_proto_ver(k_ctx->proto_ver)) |
+		 V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
+		 V_SCMD_CIPH_AUTH_SEQ_CTRL((k_ctx->mac_first == 0)) |
+		 V_SCMD_CIPH_MODE(k_ctx->state.enc_mode) |
+		 V_SCMD_AUTH_MODE(k_ctx->state.auth_mode) |
+		 V_SCMD_HMAC_CTRL(k_ctx->hmac_ctrl) |
+		 V_SCMD_IV_SIZE(k_ctx->iv_size));
+
+	tls_ofld->scmd0.ivgen_hdrlen =
+		(V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
+		 V_SCMD_KEY_CTX_INLINE(0) |
+		 V_SCMD_TLS_FRAG_ENABLE(1));
+
+	tls_ofld->mac_length = k_ctx->mac_secret_size;
+
+#ifdef notyet
+	/* XXX: Will we need this stuff? */
+	{
+		unsigned short pdus_per_ulp;
+
+		if (tls_ofld->key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
+			tls_ofld->tx_key_addr = 1;
+
+		tls_ofld->fcplenmax = get_tp_plen_max(tls_ofld);
+		tls_ofld->expn_per_ulp = tls_expansion_size(toep,
+				tls_ofld->fcplenmax, 1, &pdus_per_ulp);
+		tls_ofld->pdus_per_ulp = pdus_per_ulp;
+		tls_ofld->adjusted_plen = tls_ofld->pdus_per_ulp *
+			((tls_ofld->expn_per_ulp/tls_ofld->pdus_per_ulp) +
+			 tls_ofld->k_ctx.frag_size);
+	}
+#endif
 
 	/* Need to reserve ATID and do CPL_ACT_OPEN_REQ */
 	/*
@@ -1756,7 +1858,23 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 	/* Need to configure L2, L3, L4 */
 	/* Set CPL bypass mode in PCB */
 	/* Other PCB initialization? */
-	/* Preallocate key work request? */
+
+	/*
+	 * Preallocate a work request mbuf to hold the work request
+	 * that programs the transmit key.  The work request isn't
+	 * populated until the setup_cipher callback since the keys
+	 * aren't available yet.  However, if that callback fails the
+	 * socket won't fall back to software encryption, so the
+	 * allocation is done here where failure can be handled more
+	 * gracefully.
+	 */
+	len = roundup2(sizeof(struct tls_key_req), 16) +
+	    roundup2(sizeof(struct tls_keyctx), 32);
+	cipher->key_wr = alloc_wr_mbuf(len, M_NOWAIT);
+	if (cipher->key_wr == NULL) {
+		error = ENOMEM;
+		goto failed;
+	}
 
 	tls = sbtls_init_sb_tls(so, en, sizeof(struct t6_sbtls_cipher));
 	if (tls == NULL) {
@@ -1767,16 +1885,34 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *error)
 	cipher->toep = toep;
 
 	/*
-	 * XXX: Set function pointer for M_TLS handler to function in this
-	 * module perhaps either overloading sb_tls_crypt or more likely
-	 * as a new member of cipher.  Probably useful to leave sb_tls_crypt
-	 * NULL to catch bugs.
+	 * XXX: Set function pointer for M_TLS handler to function in
+	 * this module perhaps either overloading sb_tls_crypt or more
+	 * likely as a new member of cipher.  Probably useful to leave
+	 * sb_tls_crypt NULL to catch bugs.
+	 *
+	 * Probably need two function pointers, one for parse_pkt()
+	 * that sets len16 (parse_pkt can probably handle nsegs for
+	 * us) and then a callback from eth_tx to construct the actual
+	 * work request.
 	 */
 
 	cipher->txq = &sc->sge.txq[vi->first_txq];
 	if (inp->inp_flowtype != M_HASHTYPE_NONE)
-		txq += ((inp->inp_flowid % (vi->ntxq - vi->rsrv_noflowq)) +
-		    vi->rsrv_noflowq);
+		cipher->txq += ((inp->inp_flowid %
+		    (vi->ntxq - vi->rsrv_noflowq)) + vi->rsrv_noflowq);
+	if (en->crypt_algorithm == CRYPTO_AES_NIST_GCM_16) {
+		tls->sb_params.sb_tls_hlen = TLS_HEADER_LENGTH +
+		    AEAD_EXPLICIT_DATA_SIZE;
+		tls->sb_params.sb_tls_tlen = GCM_TAG_SIZE;
+#ifdef notyet
+	} else {
+		tls->sb_params.sb_tls_hlen = TLS_HEADER_LENGTH +
+		    CIPHER_BLOCK_SIZE;
+		/* XXX: Padding */
+		tls->sb_params.sb_tls_tlen = tls_ofld->mac_length;
+#endif
+	}
+	tls->t_type = SBTLS_T_TYPE_CHELSIO;
 	so->so_snd.sb_tls_flags |= SB_TLS_IFNET;
 	return (0);
 
@@ -1785,36 +1921,69 @@ failed:
 	return (error);
 }
 
+/* XXX: Should share this with ccr(4) eventually. */
+static void
+init_sbtls_gmac_hash(const char *key, int klen, char *ghash)
+{
+	static char zeroes[GMAC_BLOCK_LEN];
+	uint32_t keysched[4 * (RIJNDAEL_MAXNR + 1)];
+	int rounds;
+
+	rounds = rijndaelKeySetupEnc(keysched, key, klen);
+	rijndaelEncrypt(keysched, rounds, zeroes, ghash);
+}
+
 static void
 t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 {
 	struct t6_sbtls_cipher *cipher = tls->cipher;
 	struct toepcb *toep = cipher->toep;
 	struct tls_ofld_info *tls_ofld = &toep->tls;
-	struct adapter *sc = td_adapter(toep->td);
-	//struct ofld_tx_sdesc *txsd;
-	int kwrlen, kctxlen, keyid, len;
-	struct wrqe *wr;
+	struct tls_key_context *k_ctx;
+	int keyid, kwrlen, kctxlen, len;
 	struct tls_key_req *kwr;
 	struct tls_keyctx *kctx;
+	void *items[1];
 
-	/* program TLS keys */
 	/* INP_WLOCK_ASSERT(inp); */
 
+	/* Load keys into key context. */
+	k_ctx = &tls_ofld->k_ctx;
+	k_ctx->l_p_key = KEY_WRITE_TX;
+	if (tls->sb_params.iv == NULL) {
+		*error = EINVAL;
+		return;
+	}
+	memcpy(k_ctx->tx.salt, tls->sb_params.iv, SALT_SIZE);
+	if (tls->sb_params.crypt == NULL) {
+		*error = EINVAL;
+		return;
+	}
+	memcpy(k_ctx->tx.key, tls->sb_params.crypt,
+	    tls->sb_params.crypt_key_len);
+	if (k_ctx->state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
+		init_sbtls_gmac_hash(tls->sb_params.crypt,
+		    tls->sb_params.crypt_key_len,
+		    k_ctx->tx.key + tls->sb_params.crypt_key_len);
+#ifdef notyet
+	} else {
+		/* Generate ipad and opad and append after key. */
+		/*
+		 * XXX: Probably want to share ccr_init_hmac_digest
+		 * here rather than reimplementing.
+		 */
+#endif
+	}
+
+	keyid = tls_ofld->tx_key_addr;
+
+	/* Populate key work request. */
 	kwrlen = roundup2(sizeof(*kwr), 16);
 	kctxlen = roundup2(sizeof(*kctx), 32);
 	len = kwrlen + kctxlen;
 
-#if 0
-	if (toep->txsd_avail == 0)
-		return (EAGAIN);
-
-	wr = alloc_wrqe(len, cipher->txq);
-	if (wr == NULL) {
-		free_keyid(toep, keyid);
-		return (ENOMEM);
-	}
-	kwr = wrtod(wr);
+	MPASS(cipher->key_wr->m_len == len);
+	kwr = mtod(cipher->key_wr, void *);
 	memset(kwr, 0, kwrlen);
 
 	kwr->wr_hi = htobe32(V_FW_WR_OP(FW_ULPTX_WR) | F_FW_WR_COMPL |
@@ -1841,34 +2010,31 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	kctx = (struct tls_keyctx *)(kwr + 1);
 	memset(kctx, 0, kctxlen);
 
-	if (G_KEY_GET_LOC(k_ctx->l_p_key) == KEY_WRITE_TX) {
-		tls_ofld->tx_key_addr = keyid;
-		prepare_txkey_wr(kctx, k_ctx);
-	} else if (G_KEY_GET_LOC(k_ctx->l_p_key) == KEY_WRITE_RX) {
-		tls_ofld->rx_key_addr = keyid;
-		prepare_rxkey_wr(kctx, k_ctx);
-	}
+	prepare_txkey_wr(kctx, k_ctx);
 
-	txsd = &toep->txsd[toep->txsd_pidx];
-	txsd->tx_credits = DIV_ROUND_UP(len, 16);
-	txsd->plen = 0;
-	toep->tx_credits -= txsd->tx_credits;
-	if (__predict_false(++toep->txsd_pidx == toep->txsd_total))
-		toep->txsd_pidx = 0;
-	toep->txsd_avail--;
-#endif
-
-	t4_wrq_tx(sc, wr);
+	/*
+	 * Place the key work request in the transmit queue.  It
+	 * should be sent to the NIC before any TLS packets using this
+	 * session.
+	 */
+	items[0] = cipher->key_wr;
+	*error = mp_ring_enqueue(cipher->txq->r, items, 1, 1);
+	if (*error == 0)
+		cipher->key_wr = NULL;
 }
 
 static void
 t6_sbtls_clean_cipher(struct sbtls_info *tls, void *cipher_arg)
 {
 	struct t6_sbtls_cipher *cipher;
+	struct toepcb *toep;
 
 	cipher = cipher_arg;
+	toep = cipher->toep;
 
 	/* free TID, L2/L3/L4 */
+	if (cipher->key_wr != NULL)
+		m_free(cipher->key_wr);
 	free_toepcb(toep);
 }
 
@@ -1880,6 +2046,7 @@ struct sbtls_crypto_backend t6tls_backend = {
 	.setup_cipher = t6_sbtls_setup_cipher,
 	.clean_cipher = t6_sbtls_clean_cipher
 };
+#endif
 	
 void
 t4_tls_mod_load(void)
@@ -1888,16 +2055,20 @@ t4_tls_mod_load(void)
 	mtx_init(&tls_handshake_lock, "t4tls handshake", NULL, MTX_DEF);
 	t4_register_cpl_handler(CPL_TLS_DATA, do_tls_data);
 	t4_register_cpl_handler(CPL_RX_TLS_CMP, do_rx_tls_cmp);
+#ifdef KERN_TLS
 	tcp_protosw = pffindproto(PF_INET, IPPROTO_TCP, SOCK_STREAM);
 	if (sbtls_crypto_backend_register(&t6tls_backend) != 0)
 		printf("Failed to register Chelsio T6 SBTLS backend\n");
+#endif
 }
 
 void
 t4_tls_mod_unload(void)
 {
 
+#ifdef KERN_TLS
 	sbtls_crypto_backend_deregister(&t6tls_backend);
+#endif
 	t4_register_cpl_handler(CPL_TLS_DATA, NULL);
 	t4_register_cpl_handler(CPL_RX_TLS_CMP, NULL);
 	mtx_destroy(&tls_handshake_lock);
