@@ -1786,13 +1786,10 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	sc = vi->pi->adapter;
 
 	/*
-	 * XXX: Needs more checks that TOE is enabled (tod is valid) and
-	 * that custom config file with KTLS settings has been loaded.
-	 *
-	 * XXX: Also need to disable "normal" TOE offloads when KTLS
-	 * config file has been loaded.
+	 * XXX: Need to disable "normal" TOE offloads when KERN_TLS
+	 * is active.
 	 */
-	if (!can_tls_offload(sc))
+	if (!(sc->flags & KERN_TLS_OK) || !can_tls_offload(sc))
 		return (ENXIO);
 
 	if_printf(ifp, "Found an off-loadable KERN_TLS socket\n");
