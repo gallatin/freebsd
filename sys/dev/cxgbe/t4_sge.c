@@ -563,10 +563,19 @@ t4_enable_kern_tls(struct adapter *sc)
 	v = 0;
 	t4_set_reg_field(sc, A_TP_PC_CONFIG, m, v);
 
+	/*
+	 * XXX: This disables TCB caching to permit backdoor reads of
+	 * the TCB, not sure if this is actually required or just a
+	 * debugging aid.
+	 */
 	m = M_RDTHRESHOLD | F_WRTHRTHRESHEN | M_WRTHRTHRESH;
 	v = V_RDTHRESHOLD(1) | F_WRTHRTHRESHEN | V_WRTHRTHRESH(0x10);
 	t4_set_reg_field(sc, A_TP_CMM_CONFIG, m, v);
 
+	/*
+	 * XXX: Was this also just a debugging aid used to distinguish
+	 * offload packets from tunnel packets?
+	 */
 	m = M_IPTTL;
 	v = V_IPTTL(63);
 	t4_set_reg_field(sc, A_TP_GLOBAL_CONFIG, m, v);
