@@ -1643,6 +1643,7 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 static struct protosw *tcp_protosw;
 
 struct t6_sbtls_cipher {
+	struct adapter *sc;
 	struct toepcb *toep;
 	struct sge_txq *txq;
 	struct mbuf *key_wr;
@@ -1697,19 +1698,101 @@ init_sbtls_k_ctx(struct tls_key_context *k_ctx, struct tls_so_enable *en,
 }
 
 static int
+send_sbtls_act_open_req(struct adapter *sc, struct vi_info *vi,
+    struct socket *so, struct toepcb *toep)
+{
+	struct cpl_t6_act_open_req *cpl6;
+	struct cpl_act_open_req *cpl;
+	struct inpcb *inp;
+	struct wrqe *wr;
+	uint64_t options;
+	int error, mtu_idx, qid_atid;
+
+	inp = so->so_pcb;
+	toep->vnet = so->so_vnet;
+
+	wr = alloc_wrqe(sizeof(*cpl6), toep->ctrlq);
+	if (wr == NULL)
+		return (ENOMEM);
+
+	cpl6 = wrtod(wr);
+	cpl = (struct cpl_act_open_req *)cpl6;
+	INIT_TP_WR(cpl6, 0);
+	mtu_idx = find_best_mtu_idx(sc, &inp->inp_inc, 0);
+	qid_atid = (sc->sge.fwq.abs_id << 14) | toep->tid;
+	OPCODE_TID(cpl) = htobe32(MK_OPCODE_TID(CPL_ACT_OPEN_REQ,
+		qid_atid));
+	inp_4tuple_get(inp, &cpl->local_ip, &cpl->local_port,
+	    &cpl->peer_ip, &cpl->peer_port);
+
+	options = F_TCAM_BYPASS | V_MSS_IDX(mtu_idx) |
+	    V_ULP_MODE(ULP_MODE_NONE);
+	options |= V_L2T_IDX(toep->l2te->idx);
+	options |= V_SMAC_SEL(vi->smt_idx) | V_TX_CHAN(vi->pi->tx_chan);
+	options |= F_NON_OFFLOAD;
+#ifdef notsure
+	options |= V_ACCEPT_MODE(2);
+#endif
+	cpl->opt0 = htobe64(options);
+
+	cpl6->params = select_ntuple(vi, toep->l2te);
+
+	options = V_TX_QUEUE(sc->params.tp.tx_modq[vi->pi->tx_chan]);
+	cpl->opt2 = htobe32(options);
+
+#ifdef notsure
+	/* Code from t4_connect */
+	cpl6->iss = htobe32(tp->iss);
+#endif
+	error = t4_l2t_send(sc, wr, toep->l2te);
+	if (error == 0)
+		toep->flags |= TPF_CPL_PENDING;
+	else
+		free_wrqe(wr);
+	return (error);
+};
+
+void
+sbtls_act_establish(struct toepcb *toep)
+{
+
+	INP_WLOCK_ASSERT(toep->inp);
+	toep->flags &= TPF_CPL_PENDING;
+	wakeup(toep);
+}
+
+void
+sbtls_act_open_failure(struct adapter *sc, struct toepcb *toep)
+{
+	struct inpcb *inp = toep->inp;
+
+	free_atid(sc, toep->tid);
+	toep->tid = -1;
+
+	INP_WLOCK(inp);
+	toep->flags &= TPF_CPL_PENDING;
+	wakeup(toep);
+	INP_WUNLOCK(inp);
+}
+
+static int
 t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 {
 	struct t6_sbtls_cipher *cipher;
 	struct sbtls_info *tls;
 	struct tls_key_context *k_ctx;
 	struct tls_ofld_info *tls_ofld;
+	struct mbuf *key_wr;
+	struct sockaddr_in sin;
+	struct sockaddr *nam;
 	struct toepcb *toep;
 	struct adapter *sc;
 	struct vi_info *vi;
 	struct ifnet *ifp;
-	struct rtentry *rte;
+	struct rtentry *rt;
 	struct inpcb *inp;
 	int error, keyid, len, proto_ver;
+	bool using_atid;
 
 	/* Sanity check values in *en. */
 	if (en->key_size != en->crypt_key_len)
@@ -1774,12 +1857,12 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		return (EPROTONOSUPPORT);
 	inp = so->so_pcb;
 	INP_WLOCK_ASSERT(inp);
-	rte = inp->inp_route.ro_rt;
-	if (rte == NULL || rte->rt_ifp == NULL)
+	rt = inp->inp_route.ro_rt;
+	if (rt == NULL || rt->rt_ifp == NULL)
 		return (ENXIO);
 
 	/* XXX: Gross */
-	ifp = rte->rt_ifp;
+	ifp = rt->rt_ifp;
 	if (ifp->if_get_counter != cxgbe_get_counter)
 		return (ENXIO);
 	vi = ifp->if_softc;
@@ -1792,11 +1875,35 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	if (!(sc->flags & KERN_TLS_OK) || !can_tls_offload(sc))
 		return (ENXIO);
 
-	if_printf(ifp, "Found an off-loadable KERN_TLS socket\n");
-
 	toep = alloc_toepcb(vi, -1, -1, M_NOWAIT);
 	if (toep == NULL)
 		return (ENOMEM);
+	toep->flags |= TPF_KERN_TLS;
+
+	key_wr = NULL;
+	using_atid = true;
+	toep->tid = alloc_atid(sc, toep);
+	if (toep->tid < 0) {
+		error = ENOMEM;
+		goto failed;
+	}
+
+	if (rt->rt_flags & RTF_GATEWAY)
+		nam = rt->rt_gateway;
+	else {
+		nam = (struct sockaddr *)&sin;
+		bzero(&sin, sizeof(sin));
+		sin.sin_len = sizeof(sin);
+		sin.sin_family = AF_INET;
+		sin.sin_port = inp->inp_inc.inc_ie.ie_fport;
+		sin.sin_addr = inp->inp_inc.inc_ie.ie_faddr;
+	}
+	toep->l2te = t4_l2t_get(vi->pi, ifp, nam);
+	if (toep->l2te == NULL) {
+		error = ENOMEM;
+		goto failed;
+	}
+
 	keyid = get_new_keyid(toep);
 	if (keyid < 0) {
 		error = ENOMEM;
@@ -1843,16 +1950,35 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	}
 #endif
 
-	/* Need to reserve ATID and do CPL_ACT_OPEN_REQ */
+	error = send_sbtls_act_open_req(sc, vi, so, toep);
+	if (error)
+		goto failed;
+
 	/*
-	 * Have to drop INP while waiting for reply.  This requires
-	 * fixing sbtls_crypt_tls_enable to recheck INP validity after
-	 * invoking try in loop.
+	 * Wait for reply to active open.
 	 *
-	 * XXX: What about rm lock?  Can't sleep while that is held
-	 * either.  Yuck.
+	 * XXX: What about rm lock?  Can't sleep while that is held.
+	 *
+	 * XXX: Probably need to recheck INP validity here and and in
+	 * the try loop in sbtls_crypt_tls_enable().
 	 */
-	/* Need to configure L2, L3, L4 */
+	CTR2(KTR_CXGBE, "%s: atid %d sent CPL_ACT_OPEN_REQ", __func__,
+	    toep->tid);
+	while (toep->flags & TPF_CPL_PENDING) {
+		/*
+		 * XXX: PCATCH?  We would then have to discard the PCB
+		 * when the completion CPL arrived.
+		 */
+		error = rw_sleep(toep, &inp->inp_lock, 0, "t6tlsop", 0);
+	}
+
+	using_atid = false;
+	if (toep->tid < 0) {
+		error = ENOMEM;
+		goto failed;
+	}
+
+	/* Need to configure L3, L4 */
 	/* Set CPL bypass mode in PCB */
 	/* Other PCB initialization? */
 
@@ -1867,8 +1993,8 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	 */
 	len = roundup2(sizeof(struct tls_key_req), 16) +
 	    roundup2(sizeof(struct tls_keyctx), 32);
-	cipher->key_wr = alloc_wr_mbuf(len, M_NOWAIT);
-	if (cipher->key_wr == NULL) {
+	key_wr = alloc_wr_mbuf(len, M_NOWAIT);
+	if (key_wr == NULL) {
 		error = ENOMEM;
 		goto failed;
 	}
@@ -1879,7 +2005,9 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		goto failed;
 	}
 	cipher = tls->cipher;
+	cipher->sc = sc;
 	cipher->toep = toep;
+	cipher->key_wr = key_wr;
 
 	/*
 	 * XXX: Set function pointer for M_TLS handler to function in
@@ -1914,6 +2042,18 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	return (0);
 
 failed:
+	if (key_wr != NULL)
+		m_free(key_wr);
+	if (toep->tid >= 0) {
+		if (using_atid)
+			free_atid(sc, toep->tid);
+		else {
+			remove_tid(sc, toep->tid, 1);
+			release_tid(sc, toep->tid, toep->ctrlq);
+		}
+	}
+	if (toep->l2te)
+		t4_l2t_release(toep->l2te);
 	free_toepcb(toep);
 	return (error);
 }
@@ -2024,14 +2164,22 @@ static void
 t6_sbtls_clean_cipher(struct sbtls_info *tls, void *cipher_arg)
 {
 	struct t6_sbtls_cipher *cipher;
+	struct adapter *sc;
 	struct toepcb *toep;
 
 	cipher = cipher_arg;
+	sc = cipher->sc;
 	toep = cipher->toep;
 
-	/* free TID, L2/L3/L4 */
+	/* free TID, L3/L4 */
 	if (cipher->key_wr != NULL)
 		m_free(cipher->key_wr);
+	if (toep->l2te)
+		t4_l2t_release(toep->l2te);
+	if (toep->tid >= 0) {
+		remove_tid(sc, toep->tid, 1);
+		release_tid(sc, toep->tid, toep->ctrlq);
+	}
 	free_toepcb(toep);
 }
 

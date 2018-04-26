@@ -64,11 +64,9 @@ __FBSDID("$FreeBSD$");
 #include "tom/t4_tom.h"
 
 /* atid services */
-static int alloc_atid(struct adapter *, void *);
 static void *lookup_atid(struct adapter *, int);
-static void free_atid(struct adapter *, int);
 
-static int
+int
 alloc_atid(struct adapter *sc, void *ctx)
 {
 	struct tid_info *t = &sc->tids;
@@ -95,7 +93,7 @@ lookup_atid(struct adapter *sc, int atid)
 	return (t->atid_tab[atid].data);
 }
 
-static void
+void
 free_atid(struct adapter *sc, int atid)
 {
 	struct tid_info *t = &sc->tids;
@@ -132,6 +130,10 @@ do_act_establish(struct sge_iq *iq, const struct rss_header *rss,
 	INP_WLOCK(inp);
 	toep->tid = tid;
 	insert_tid(sc, tid, toep, inp->inp_vflag & INP_IPV6 ? 2 : 1);
+	if (toep->flags & TPF_KERN_TLS) {
+		sbtls_act_establish(toep);
+		goto done;
+	}
 	if (inp->inp_flags & INP_DROPPED) {
 
 		/* socket closed by the kernel before hw told us it connected */
@@ -223,8 +225,12 @@ do_act_open_rpl(struct sge_iq *iq, const struct rss_header *rss,
 	if (status && act_open_has_tid(status))
 		release_tid(sc, GET_TID(cpl), toep->ctrlq);
 
-	rc = act_open_rpl_status_to_errno(status);
-	act_open_failure_cleanup(sc, atid, rc);
+	if (toep->flags & TPF_KERN_TLS)
+		sbtls_act_open_failure(sc, toep);
+	else {
+		rc = act_open_rpl_status_to_errno(status);
+		act_open_failure_cleanup(sc, atid, rc);
+	}
 
 	return (0);
 }
