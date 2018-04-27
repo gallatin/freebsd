@@ -2352,8 +2352,11 @@ restart:
 	}
 	set_mbuf_nsegs(m0, nsegs);
 	set_mbuf_cflags(m0, cflags);
-	if (cflags & MC_TLS)
-		panic("TLS mbuf");
+	if (cflags & MC_TLS) {
+		device_printf(sc->dev, "Dropping TLS mbuf\n");
+		rc = EPROTONOSUPPORT;
+		goto fail;
+	}
 	if (sc->flags & IS_VF)
 		set_mbuf_len16(m0, txpkt_vm_len16(nsegs, needs_tso(m0)));
 	else
