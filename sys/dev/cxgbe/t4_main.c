@@ -33,6 +33,7 @@ __FBSDID("$FreeBSD$");
 #include "opt_ddb.h"
 #include "opt_inet.h"
 #include "opt_inet6.h"
+#include "opt_kern_tls.h"
 #include "opt_rss.h"
 
 #include <sys/param.h>
@@ -468,6 +469,14 @@ TUNABLE_INT("hw.cxgbe.num_vis", &t4_num_vis);
  */
 static int pcie_relaxed_ordering = -1;
 TUNABLE_INT("hw.cxgbe.pcie_relaxed_ordering", &pcie_relaxed_ordering);
+
+#ifdef KERN_TLS
+/*
+ * This enables KERN_TLS for all adapters if set.
+ */
+static int t4_kern_tls = 0;
+TUNABLE_INT("hw.cxgbe.kern_tls", &t4_kern_tls);
+#endif
 
 
 /* Functions used by VIs to obtain unique MAC addresses for each VI. */
@@ -3676,6 +3685,53 @@ get_params__post_init(struct adapter *sc)
 	return (rc);
 }
 
+#ifdef KERN_TLS
+static void
+t4_enable_kern_tls(struct adapter *sc)
+{
+	uint32_t m, v;
+
+	m = F_ENABLECBYP;
+	v = F_ENABLECBYP;
+	t4_set_reg_field(sc, A_TP_PARA_REG6, m, v);
+
+	m = F_CPL_FLAGS_UPDATE_EN | F_SEQ_UPDATE_EN;
+	v = F_CPL_FLAGS_UPDATE_EN | F_SEQ_UPDATE_EN;
+	t4_set_reg_field(sc, A_ULP_TX_CONFIG, m, v);
+
+	m = F_NICMODE;
+	v = F_NICMODE;
+	t4_set_reg_field(sc, A_TP_IN_CONFIG, m, v);
+
+	m = F_LOOKUPEVERYPKT;
+	v = 0;
+	t4_set_reg_field(sc, A_TP_INGRESS_CONFIG, m, v);
+
+	m = F_TXDEFERENABLE;
+	v = 0;
+	t4_set_reg_field(sc, A_TP_PC_CONFIG, m, v);
+
+	/*
+	 * XXX: This disables TCB caching to permit backdoor reads of
+	 * the TCB, not sure if this is actually required or just a
+	 * debugging aid.
+	 */
+	m = M_RDTHRESHOLD | F_WRTHRTHRESHEN | M_WRTHRTHRESH;
+	v = V_RDTHRESHOLD(1) | F_WRTHRTHRESHEN | V_WRTHRTHRESH(0x10);
+	t4_set_reg_field(sc, A_TP_CMM_CONFIG, m, v);
+
+	/*
+	 * XXX: Was this also just a debugging aid used to distinguish
+	 * offload packets from tunnel packets?
+	 */
+	m = M_IPTTL;
+	v = V_IPTTL(63);
+	t4_set_reg_field(sc, A_TP_GLOBAL_CONFIG, m, v);
+
+	sc->flags |= KERN_TLS_OK;
+}
+#endif
+
 static int
 set_params__post_init(struct adapter *sc)
 {
@@ -3743,6 +3799,11 @@ set_params__post_init(struct adapter *sc)
 			    M_TIMERBACKOFFINDEX0 << shift, v << shift);
 		}
 	}
+#endif
+
+#ifdef KERN_TLS
+	if (t4_kern_tls != 0 && sc->cryptocaps & FW_CAPS_CONFIG_TLSKEYS)
+		t4_enable_kern_tls(sc);
 #endif
 	return (0);
 }
