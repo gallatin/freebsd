@@ -1820,6 +1820,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		default:
 			return (EPROTONOSUPPORT);
 		}
+		break;
 #endif
 	case CRYPTO_AES_NIST_GCM_16:
 		if (en->iv_len != SALT_SIZE)
@@ -1840,6 +1841,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		default:
 			return (EINVAL);
 		}
+		break;
 	default:
 		return (EPROTONOSUPPORT);
 	}
@@ -1912,44 +1914,6 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	tls_ofld = &toep->tls;
 	tls_ofld->tx_key_addr = keyid;
 
-	k_ctx = &tls_ofld->k_ctx;
-	init_sbtls_k_ctx(k_ctx, en, tls);
-
-	tls_ofld->scmd0.seqno_numivs =
-		(V_SCMD_SEQ_NO_CTRL(3) |
-		 V_SCMD_PROTO_VERSION(get_proto_ver(k_ctx->proto_ver)) |
-		 V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
-		 V_SCMD_CIPH_AUTH_SEQ_CTRL((k_ctx->mac_first == 0)) |
-		 V_SCMD_CIPH_MODE(k_ctx->state.enc_mode) |
-		 V_SCMD_AUTH_MODE(k_ctx->state.auth_mode) |
-		 V_SCMD_HMAC_CTRL(k_ctx->hmac_ctrl) |
-		 V_SCMD_IV_SIZE(k_ctx->iv_size));
-
-	tls_ofld->scmd0.ivgen_hdrlen =
-		(V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
-		 V_SCMD_KEY_CTX_INLINE(0) |
-		 V_SCMD_TLS_FRAG_ENABLE(1));
-
-	tls_ofld->mac_length = k_ctx->mac_secret_size;
-
-#ifdef notyet
-	/* XXX: Will we need this stuff? */
-	{
-		unsigned short pdus_per_ulp;
-
-		if (tls_ofld->key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
-			tls_ofld->tx_key_addr = 1;
-
-		tls_ofld->fcplenmax = get_tp_plen_max(tls_ofld);
-		tls_ofld->expn_per_ulp = tls_expansion_size(toep,
-				tls_ofld->fcplenmax, 1, &pdus_per_ulp);
-		tls_ofld->pdus_per_ulp = pdus_per_ulp;
-		tls_ofld->adjusted_plen = tls_ofld->pdus_per_ulp *
-			((tls_ofld->expn_per_ulp/tls_ofld->pdus_per_ulp) +
-			 tls_ofld->k_ctx.frag_size);
-	}
-#endif
-
 	error = send_sbtls_act_open_req(sc, vi, so, toep);
 	if (error)
 		goto failed;
@@ -2008,6 +1972,44 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	cipher->sc = sc;
 	cipher->toep = toep;
 	cipher->key_wr = key_wr;
+
+	k_ctx = &tls_ofld->k_ctx;
+	init_sbtls_k_ctx(k_ctx, en, tls);
+
+	tls_ofld->scmd0.seqno_numivs =
+		(V_SCMD_SEQ_NO_CTRL(3) |
+		 V_SCMD_PROTO_VERSION(get_proto_ver(k_ctx->proto_ver)) |
+		 V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
+		 V_SCMD_CIPH_AUTH_SEQ_CTRL((k_ctx->mac_first == 0)) |
+		 V_SCMD_CIPH_MODE(k_ctx->state.enc_mode) |
+		 V_SCMD_AUTH_MODE(k_ctx->state.auth_mode) |
+		 V_SCMD_HMAC_CTRL(k_ctx->hmac_ctrl) |
+		 V_SCMD_IV_SIZE(k_ctx->iv_size));
+
+	tls_ofld->scmd0.ivgen_hdrlen =
+		(V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
+		 V_SCMD_KEY_CTX_INLINE(0) |
+		 V_SCMD_TLS_FRAG_ENABLE(1));
+
+	tls_ofld->mac_length = k_ctx->mac_secret_size;
+
+#ifdef notyet
+	/* XXX: Will we need this stuff? */
+	{
+		unsigned short pdus_per_ulp;
+
+		if (tls_ofld->key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
+			tls_ofld->tx_key_addr = 1;
+
+		tls_ofld->fcplenmax = get_tp_plen_max(tls_ofld);
+		tls_ofld->expn_per_ulp = tls_expansion_size(toep,
+				tls_ofld->fcplenmax, 1, &pdus_per_ulp);
+		tls_ofld->pdus_per_ulp = pdus_per_ulp;
+		tls_ofld->adjusted_plen = tls_ofld->pdus_per_ulp *
+			((tls_ofld->expn_per_ulp/tls_ofld->pdus_per_ulp) +
+			 tls_ofld->k_ctx.frag_size);
+	}
+#endif
 
 	/*
 	 * XXX: Set function pointer for M_TLS handler to function in
