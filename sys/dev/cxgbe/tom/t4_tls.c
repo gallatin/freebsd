@@ -1871,10 +1871,11 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	sc = vi->pi->adapter;
 
 	/*
-	 * XXX: Need to disable "normal" TOE offloads when KERN_TLS
-	 * is active.
+	 * XXX: This requires TOE to be activated so that the atid table
+	 * and TLS key map are initialized.
 	 */
-	if (!(sc->flags & KERN_TLS_OK) || !can_tls_offload(sc))
+	if (!(sc->flags & KERN_TLS_OK) || !can_tls_offload(sc) ||
+	    sc->tom_softc == NULL)
 		return (ENXIO);
 
 	toep = alloc_toepcb(vi, -1, -1, M_NOWAIT);
