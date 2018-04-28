@@ -1947,6 +1947,15 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	/* Need to configure L3, L4 */
 	/* Set CPL bypass mode in PCB */
 	/* Other PCB initialization? */
+#ifdef notyet
+	/* Clear S_TF_NON_OFFLOAD */
+	sbtls_set_tcb(toep, W_TCB_T_FLAGS, V_TCB_T_FLAGS(V_TF_NON_OFFLOAD(1)),
+	    0);
+	/* Mark as ESTABLISHED. */
+	sbtls_set_tcb(toep, W_TCB_T_STATE, V_TCB_T_STATE(M_TCB_T_STATE),
+	    V_TCB_T_STATE(4));
+	sbtls_set_tcb(toep, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX), 0);
+#endif
 
 	/*
 	 * Preallocate a work request mbuf to hold the work request
