@@ -1915,6 +1915,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	tls_ofld = &toep->tls;
 	tls_ofld->tx_key_addr = keyid;
 
+	toep->inp = inp;
 	error = send_sbtls_act_open_req(sc, vi, so, toep);
 	if (error)
 		goto failed;
