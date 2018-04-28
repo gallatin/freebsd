@@ -1753,17 +1753,19 @@ send_sbtls_act_open_req(struct adapter *sc, struct vi_info *vi,
 };
 
 void
-sbtls_act_open_rpl(struct adapter *sc, struct toepcb *toep, u_int status)
+sbtls_act_open_rpl(struct adapter *sc, struct toepcb *toep, u_int status,
+    const struct cpl_act_open_rpl *cpl)
 {
 	struct inpcb *inp = toep->inp;
 
-	if (status != 0) {
-		free_atid(sc, toep->tid);
+	free_atid(sc, toep->tid);
+	if (status == 0)
+		toep->tid = GET_TID(cpl);
+	else
 		toep->tid = -1;
-	}
 
 	INP_WLOCK(inp);
-	toep->flags &= TPF_CPL_PENDING;
+	toep->flags &= ~TPF_CPL_PENDING;
 	wakeup(toep);
 	INP_WUNLOCK(inp);
 }
