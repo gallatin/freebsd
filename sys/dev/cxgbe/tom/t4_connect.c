@@ -122,6 +122,8 @@ do_act_establish(struct sge_iq *iq, const struct rss_header *rss,
 
 	KASSERT(m == NULL, ("%s: wasn't expecting payload", __func__));
 	KASSERT(toep->tid == atid, ("%s: toep tid/atid mismatch", __func__));
+	KASSERT((toep->flags & TPF_KERN_TLS) == 0, ("%s: KERN_TLS pcb",
+	    __func__));
 
 	CTR3(KTR_CXGBE, "%s: atid %u, tid %u", __func__, atid, tid);
 	free_atid(sc, atid);
@@ -130,10 +132,6 @@ do_act_establish(struct sge_iq *iq, const struct rss_header *rss,
 	INP_WLOCK(inp);
 	toep->tid = tid;
 	insert_tid(sc, tid, toep, inp->inp_vflag & INP_IPV6 ? 2 : 1);
-	if (toep->flags & TPF_KERN_TLS) {
-		sbtls_act_establish(toep);
-		goto done;
-	}
 	if (inp->inp_flags & INP_DROPPED) {
 
 		/* socket closed by the kernel before hw told us it connected */
@@ -218,6 +216,11 @@ do_act_open_rpl(struct sge_iq *iq, const struct rss_header *rss,
 
 	CTR3(KTR_CXGBE, "%s: atid %u, status %u ", __func__, atid, status);
 
+	if (toep->flags & TPF_KERN_TLS) {
+		sbtls_act_open_rpl(sc, toep, status);
+		return (0);
+	}
+
 	/* Ignore negative advice */
 	if (negative_advice(status))
 		return (0);
@@ -225,12 +228,8 @@ do_act_open_rpl(struct sge_iq *iq, const struct rss_header *rss,
 	if (status && act_open_has_tid(status))
 		release_tid(sc, GET_TID(cpl), toep->ctrlq);
 
-	if (toep->flags & TPF_KERN_TLS)
-		sbtls_act_open_failure(sc, toep);
-	else {
-		rc = act_open_rpl_status_to_errno(status);
-		act_open_failure_cleanup(sc, atid, rc);
-	}
+	rc = act_open_rpl_status_to_errno(status);
+	act_open_failure_cleanup(sc, atid, rc);
 
 	return (0);
 }
