@@ -2108,7 +2108,7 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	    tls->sb_params.crypt_key_len);
 	if (k_ctx->state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
 		init_sbtls_gmac_hash(tls->sb_params.crypt,
-		    tls->sb_params.crypt_key_len,
+		    tls->sb_params.crypt_key_len * 8,
 		    k_ctx->tx.key + tls->sb_params.crypt_key_len);
 #ifdef notyet
 	} else {
