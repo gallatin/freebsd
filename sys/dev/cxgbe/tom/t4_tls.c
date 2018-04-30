@@ -1974,9 +1974,10 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		txq += ((inp->inp_flowid % (vi->ntxq - vi->rsrv_noflowq)) +
 		    vi->rsrv_noflowq);
 
-	/* Clear S_TF_NON_OFFLOAD */
+	/* Clear TF_NON_OFFLOAD and set TF_CORE_BYPASS */
 	error = sbtls_set_tcb_field(toep, txq, W_TCB_T_FLAGS,
-	    V_TCB_T_FLAGS(V_TF_NON_OFFLOAD(1)), 0);
+	    V_TCB_T_FLAGS(V_TF_CORE_BYPASS(1) | V_TF_NON_OFFLOAD(1)),
+	    V_TCB_T_FLAGS(V_TF_CORE_BYPASS(1)));
 	if (error)
 		goto failed;
 #ifdef notsure
