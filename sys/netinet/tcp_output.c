@@ -1007,7 +1007,8 @@ send:
 			msb = NULL;
 		else
 			msb = &so->so_snd;
-		if (len <= MHLEN - hdrlen - max_linkhdr) {
+		if (len <= MHLEN - hdrlen - max_linkhdr &&
+		    !mbuf_is_ifnet_tls(mb)) {
 			if (msb != NULL)
 				sbsndptr_adv(&so->so_snd, mb, len);
 			m_copydata(mb, moff, len,
