@@ -1641,7 +1641,8 @@ restart:
 				SOCK_UNLOCK(so);
 			}
 
-			if (tls != NULL) {
+			if (tls != NULL &&
+			    !(so->so_snd.sb_tls_flags & SB_TLS_IFNET)) {
 				/*
 				 * Note that error is intentionally
 				 * ignored.
