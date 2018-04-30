@@ -476,6 +476,7 @@ free_keyid(struct toepcb *toep, int keyid)
 {
 	struct tom_data *td = toep->td;
 
+	CTR3(KTR_CXGBE, "%s: tid %d key addr %#x", __func__, toep->tid, keyid);
 	vmem_free(td->key_map, keyid, TLS_KEY_CONTEXT_SZ);
 }
 
@@ -1909,6 +1910,8 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	}
 	tls_ofld = &toep->tls;
 	tls_ofld->tx_key_addr = keyid;
+	CTR3(KTR_CXGBE, "%s: atid %d allocated TX key addr %#x", __func__,
+	    toep->tid, tls_ofld->tx_key_addr);
 
 	toep->inp = inp;
 	error = send_sbtls_act_open_req(sc, vi, so, toep);
@@ -2164,8 +2167,10 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	 */
 	items[0] = cipher->key_wr;
 	*error = mp_ring_enqueue(cipher->txq->r, items, 1, 1);
-	if (*error == 0)
+	if (*error == 0) {
 		cipher->key_wr = NULL;
+		CTR2(KTR_CXGBE, "%s: tid %d sent key WR", __func__, toep->tid);
+	}
 }
 
 static void
@@ -2178,6 +2183,8 @@ t6_sbtls_clean_cipher(struct sbtls_info *tls, void *cipher_arg)
 	cipher = cipher_arg;
 	sc = cipher->sc;
 	toep = cipher->toep;
+
+	CTR2(KTR_CXGBE, "%s: tid %d", __func__, toep->tid);
 
 	/* free TID, L3/L4 */
 	if (cipher->key_wr != NULL)
