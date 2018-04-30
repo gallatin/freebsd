@@ -1878,6 +1878,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	if (toep == NULL)
 		return (ENOMEM);
 	toep->flags |= TPF_KERN_TLS;
+	set_ulp_mode(toep, ULP_MODE_NONE);
 
 	key_wr = NULL;
 	using_atid = true;
