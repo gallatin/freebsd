@@ -1772,6 +1772,31 @@ sbtls_act_open_rpl(struct adapter *sc, struct toepcb *toep, u_int status,
 }
 
 static int
+sbtls_set_tcb_field(struct toepcb *toep, struct sge_txq *txq, uint16_t word,
+    uint64_t mask, uint64_t val)
+{
+	struct cpl_set_tcb_field *cpl;
+	struct mbuf *m;
+	void *items[1];
+	int error;
+
+	m = alloc_wr_mbuf(sizeof(struct cpl_set_tcb_field), M_NOWAIT);
+	if (m == NULL)
+		return (ENOMEM);
+	cpl = mtod(m, void *);
+	INIT_TP_WR_MIT_CPL(cpl, CPL_SET_TCB_FIELD, toep->tid);
+	cpl->reply_ctrl = htobe16(F_NO_REPLY);
+	cpl->word_cookie = htobe16(V_WORD(word));
+	cpl->mask = htobe64(mask);
+	cpl->val = htobe64(val);
+	items[0] = m;
+	error = mp_ring_enqueue(txq->r, items, 1, 1);
+	if (error)
+		m_free(m);
+	return (error);
+}
+
+static int
 t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 {
 	struct t6_sbtls_cipher *cipher;
@@ -1787,6 +1812,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	struct ifnet *ifp;
 	struct rtentry *rt;
 	struct inpcb *inp;
+	struct sge_txq *txq;
 	int error, keyid, len, proto_ver;
 	bool using_atid;
 
@@ -1943,17 +1969,21 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		goto failed;
 	}
 
-	/* Need to configure L3, L4 */
-	/* Set CPL bypass mode in PCB */
-	/* Other PCB initialization? */
-#ifdef notyet
+	txq = &sc->sge.txq[vi->first_txq];
+	if (inp->inp_flowtype != M_HASHTYPE_NONE)
+		txq += ((inp->inp_flowid % (vi->ntxq - vi->rsrv_noflowq)) +
+		    vi->rsrv_noflowq);
+
 	/* Clear S_TF_NON_OFFLOAD */
-	sbtls_set_tcb(toep, W_TCB_T_FLAGS, V_TCB_T_FLAGS(V_TF_NON_OFFLOAD(1)),
-	    0);
-	/* Mark as ESTABLISHED. */
-	sbtls_set_tcb(toep, W_TCB_T_STATE, V_TCB_T_STATE(M_TCB_T_STATE),
-	    V_TCB_T_STATE(4));
-	sbtls_set_tcb(toep, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX), 0);
+	error = sbtls_set_tcb_field(toep, txq, W_TCB_T_FLAGS,
+	    V_TCB_T_FLAGS(V_TF_NON_OFFLOAD(1)), 0);
+	if (error)
+		goto failed;
+#ifdef notsure
+	error = sbtls_set_tcb_field(toep, txq, W_TCB_TX_MAX,
+	    V_TCB_TX_MAX(M_TCB_TX_MAX), 0);
+	if (error)
+		goto failed;
 #endif
 
 	/*
@@ -1981,6 +2011,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	cipher = tls->cipher;
 	cipher->sc = sc;
 	cipher->toep = toep;
+	cipher->txq = txq;
 	cipher->key_wr = key_wr;
 
 	k_ctx = &tls_ofld->k_ctx;
@@ -2033,10 +2064,6 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	 * work request.
 	 */
 
-	cipher->txq = &sc->sge.txq[vi->first_txq];
-	if (inp->inp_flowtype != M_HASHTYPE_NONE)
-		cipher->txq += ((inp->inp_flowid %
-		    (vi->ntxq - vi->rsrv_noflowq)) + vi->rsrv_noflowq);
 	if (en->crypt_algorithm == CRYPTO_AES_NIST_GCM_16) {
 		tls->sb_params.sb_tls_hlen = TLS_HEADER_LENGTH +
 		    AEAD_EXPLICIT_DATA_SIZE;
