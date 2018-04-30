@@ -2131,7 +2131,7 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	kwr = mtod(cipher->key_wr, void *);
 	memset(kwr, 0, kwrlen);
 
-	kwr->wr_hi = htobe32(V_FW_WR_OP(FW_ULPTX_WR) | F_FW_WR_COMPL |
+	kwr->wr_hi = htobe32(V_FW_WR_OP(FW_ULPTX_WR) |
 	    F_FW_WR_ATOMIC);
 	kwr->wr_mid = htobe32(V_FW_WR_LEN16(DIV_ROUND_UP(len, 16)) |
 	    V_FW_WR_FLOWID(toep->tid));
