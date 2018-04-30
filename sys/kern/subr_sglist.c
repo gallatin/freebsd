@@ -273,6 +273,17 @@ sglist_count_ext_pgs(struct mbuf_ext_pgs *ext_pgs, size_t off, size_t len)
 	return (nsegs);
 }
 
+int
+sglist_count_mb_ext_pgs(struct mbuf *m)
+{
+	struct mbuf_ext_pgs *ext_pgs;
+
+	/* for now, all unmapped mbufs are assumed to be EXT_PGS */
+	MBUF_EXT_PGS_ASSERT(m);
+	ext_pgs = (void *)m->m_ext.ext_buf;
+	return (sglist_count_ext_pgs(ext_pgs, mtod(m, vm_offset_t), m->m_len));
+}
+
 /*
  * Allocate a scatter/gather list along with 'nsegs' segments.  The
  * 'mflags' parameters are the same as passed to malloc(9).  The caller
@@ -422,7 +433,6 @@ sglist_append_ext_pgs(struct sglist *sg, struct mbuf_ext_pgs *ext_pgs,
 	return (error);
 }
 
-static inline
 int
 sglist_append_mb_ext_pgs(struct sglist *sg, struct mbuf *m)
 {
