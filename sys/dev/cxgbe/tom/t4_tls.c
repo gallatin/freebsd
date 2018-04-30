@@ -1720,7 +1720,7 @@ send_sbtls_act_open_req(struct adapter *sc, struct vi_info *vi,
 	cpl = (struct cpl_act_open_req *)cpl6;
 	INIT_TP_WR(cpl6, 0);
 	mtu_idx = find_best_mtu_idx(sc, &inp->inp_inc, 0);
-	qid_atid = (sc->sge.fwq.abs_id << 14) | toep->tid;
+	qid_atid = V_TID_QID(sc->sge.fwq.abs_id) | V_TID_TID(toep->tid);
 	OPCODE_TID(cpl) = htobe32(MK_OPCODE_TID(CPL_ACT_OPEN_REQ,
 		qid_atid));
 	inp_4tuple_get(inp, &cpl->local_ip, &cpl->local_port,
