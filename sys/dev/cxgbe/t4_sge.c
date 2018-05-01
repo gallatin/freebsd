@@ -2127,6 +2127,25 @@ is_tls_mbuf(struct mbuf *m)
 	return (ext_pgs->so != NULL);
 }
 
+static inline struct t6_sbtls_cipher *
+tls_mbuf_cipher(struct mbuf *m)
+{
+	struct mbuf_ext_pgs *ext_pgs;
+
+	while (m != NULL) {
+		if (m->m_flags & M_NOMAP) {
+			/* for now, all unmapped mbufs are assumed to be EXT_PGS */
+			MBUF_EXT_PGS_ASSERT(m);
+			ext_pgs = (void *)m->m_ext.ext_buf;
+			MPASS(ext_pgs->so != NULL);
+			MPASS(ext_pgs->so->so_snd.sb_tls_flags & SB_TLS_IFNET);
+			return (ext_pgs->so->so_snd.sb_tls_info->cipher);
+		}
+		m = m->m_next;
+	}
+	return (NULL);
+}
+
 static inline int
 count_mbuf_ext_pgs(struct mbuf *m, vm_paddr_t *lastb)
 {
@@ -2204,7 +2223,8 @@ count_mbuf_ext_pgs(struct mbuf *m, vm_paddr_t *lastb)
  * must have at least one mbuf that's not empty.
  */
 static inline int
-count_mbuf_nsegs(struct mbuf *m, uint8_t *cflags)
+count_mbuf_nsegs(struct mbuf *m, uint8_t *cflags,
+    struct t6_sbtls_cipher **cipherp)
 {
 	vm_paddr_t lastb, next;
 	vm_offset_t va;
@@ -2221,8 +2241,11 @@ count_mbuf_nsegs(struct mbuf *m, uint8_t *cflags)
 			continue;
 		if ((m->m_flags & M_NOMAP) != 0) {
 			*cflags |= MC_NOMAP;
-			if (is_tls_mbuf(m))
+			if (is_tls_mbuf(m)) {
+				MPASS(*cipherp == NULL);
 				*cflags |= MC_TLS;
+				*cipherp = tls_mbuf_cipher(m);
+			}
 			nsegs += count_mbuf_ext_pgs(m, &lastb);
 			continue;
 		}
@@ -2253,6 +2276,7 @@ parse_pkt(struct adapter *sc, struct mbuf **mp)
 #if defined(INET) || defined(INET6)
 	struct tcphdr *tcp;
 #endif
+	struct t6_sbtls_cipher *cipher;
 	uint16_t eh_type;
 	uint8_t cflags;
 
@@ -2272,7 +2296,19 @@ restart:
 	 */
 	M_ASSERTPKTHDR(m0);
 	MPASS(m0->m_pkthdr.len > 0);
-	nsegs = count_mbuf_nsegs(m0, &cflags);
+	cipher = NULL;
+	nsegs = count_mbuf_nsegs(m0, &cflags, &cipher);
+	if (cflags & MC_TLS) {
+		int len16;
+
+		set_mbuf_cflags(m0, cflags);
+		rc = cipher->parse_pkt(cipher, m0, &nsegs, &len16);
+		if (rc != 0)
+			goto fail;
+		set_mbuf_nsegs(m0, nsegs);
+		set_mbuf_len16(m0, len16);
+		return (0);
+	}
 	if (nsegs > (needs_tso(m0) ? TX_SGL_SEGS_TSO : TX_SGL_SEGS)) {
 		if (defragged++ > 0 || (m = m_defrag(m0, M_NOWAIT)) == NULL) {
 			rc = EFBIG;
@@ -2295,11 +2331,6 @@ restart:
 	}
 	set_mbuf_nsegs(m0, nsegs);
 	set_mbuf_cflags(m0, cflags);
-	if (cflags & MC_TLS) {
-		device_printf(sc->dev, "Dropping TLS mbuf\n");
-		rc = EPROTONOSUPPORT;
-		goto fail;
-	}
 	if (sc->flags & IS_VF)
 		set_mbuf_len16(m0, txpkt_vm_len16(nsegs, needs_tso(m0)));
 	else
@@ -2556,7 +2587,16 @@ eth_tx(struct mp_ring *r, u_int cidx, u_int pidx)
 			next_cidx = 0;
 
 		wr = (void *)&eq->desc[eq->pidx];
-		if (sc->flags & IS_VF) {
+		if (mbuf_cflags(m0) & MC_TLS) {
+			struct t6_sbtls_cipher *cipher;
+
+			total++;
+			remaining--;
+			ETHER_BPF_MTAP(ifp, m0);
+			cipher = tls_mbuf_cipher(m0);
+			n = cipher->write_tls_wr(cipher, txq, (void *)wr, m0,
+			    mbuf_nsegs(m0), available);
+		} else if (sc->flags & IS_VF) {
 			total++;
 			remaining--;
 			ETHER_BPF_MTAP(ifp, m0);

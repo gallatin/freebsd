@@ -1643,12 +1643,10 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 #ifdef KERN_TLS
 static struct protosw *tcp_protosw;
 
-struct t6_sbtls_cipher {
-	struct adapter *sc;
-	struct toepcb *toep;
-	struct sge_txq *txq;
-	struct mbuf *key_wr;
-};
+static int sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m,
+    int *nsegsp, int *len16p);
+static int sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
+    void *wr, struct mbuf *m, u_int nsegs, u_int available);
 
 static void
 init_sbtls_k_ctx(struct tls_key_context *k_ctx, struct tls_so_enable *en,
@@ -2010,6 +2008,8 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		goto failed;
 	}
 	cipher = tls->cipher;
+	cipher->parse_pkt = sbtls_parse_pkt;
+	cipher->write_tls_wr = sbtls_write_wr;
 	cipher->sc = sc;
 	cipher->toep = toep;
 	cipher->txq = txq;
@@ -2200,6 +2200,74 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 		cipher->key_wr = NULL;
 		CTR2(KTR_CXGBE, "%s: tid %d sent key WR", __func__, toep->tid);
 	}
+}
+
+static int
+sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
+    int *len16p)
+{
+	struct mbuf_ext_pgs *ext_pgs;
+	struct tls_record_layer *hdr;
+	struct mbuf *m_tls;
+	u_int nsegs, plen, wr_len;
+
+	/* Find the TLS record. */
+	for (m_tls = m;; m_tls = m_tls->m_next)
+		if (m_tls->m_flags & M_NOMAP)
+			break;
+
+	/*
+	 * Determine the size of the entire TLS record payload
+	 * excluding the trailer.
+	 */
+	ext_pgs = (void *)m->m_ext.ext_buf;
+	hdr = (void *)ext_pgs->hdr;
+	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
+
+	wr_len = sizeof(struct fw_ulptx_wr);	// 16
+	wr_len += sizeof(struct ulp_txpkt);	// 8
+	wr_len += sizeof(struct ulptx_idata);	// 8
+	wr_len += sizeof(struct cpl_tx_sec_pdu);// 32
+	wr_len += key_size(cipher->toep);	// 16
+	wr_len += sizeof(struct cpl_tx_data);	// 16
+	/* XXX: immediate data eventually */
+#ifdef notyet
+	if (plen <= SGE_MAX_WR_LEN - wr_len) {
+		*nsegsp = 0;
+		wr_len += plen;
+	} else {
+#else
+	{
+#endif
+		/* XXX: eventually make tls_hdr always immediate? */
+		*nsegsp = sglist_count_ext_pgs(ext_pgs, 0, plen);
+
+		/* First segment is part of ulptx_sgl. */
+		nsegs = *nsegsp - 1;
+
+		wr_len += sizeof(struct ulptx_sgl);
+		wr_len += 8 * ((3 * nsegs) / 2 + (nsegs & 1));
+	}
+
+	wr_len = roundup2(wr_len, 16);
+	if (wr_len > SGE_MAX_WR_LEN)
+		return (EFBIG);
+
+	/*
+	 * Include room for up to 5 SET_TCB requests before the real
+	 * work request.
+	 */
+	wr_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field, 16));
+	*len16p = wr_len / 16;
+	return (0);
+}
+
+static int
+sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *wr,
+    struct mbuf *m, u_int nsegs, u_int available)
+{
+	/* Flesh out TLS header */
+	panic("%s", __func__);
 }
 
 static void

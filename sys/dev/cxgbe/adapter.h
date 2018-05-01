@@ -869,6 +869,22 @@ struct adapter {
 	int last_op_flags;
 };
 
+/* XXX: Probably move to a different header later. */
+struct t6_sbtls_cipher;
+typedef int (*parse_tls_pkt_t)(struct t6_sbtls_cipher *, struct mbuf *, int *,
+    int *);
+typedef int (*write_tls_wr_t)(struct t6_sbtls_cipher *, struct sge_txq *,
+    void *, struct mbuf *, u_int, u_int);
+
+struct t6_sbtls_cipher {
+	parse_tls_pkt_t parse_pkt;
+	write_tls_wr_t write_tls_wr;
+	struct adapter *sc;
+	struct toepcb *toep;
+	struct sge_txq *txq;
+	struct mbuf *key_wr;
+};
+
 #define ADAPTER_LOCK(sc)		mtx_lock(&(sc)->sc_lock)
 #define ADAPTER_UNLOCK(sc)		mtx_unlock(&(sc)->sc_lock)
 #define ADAPTER_LOCK_ASSERT_OWNED(sc)	mtx_assert(&(sc)->sc_lock, MA_OWNED)
