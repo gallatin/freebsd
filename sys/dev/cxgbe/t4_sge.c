@@ -2633,7 +2633,7 @@ eth_tx(struct mp_ring *r, u_int cidx, u_int pidx)
 		} else if (mbuf_cflags(m0) & MC_RAW_WR) {
 			total++;
 			remaining--;
-			n = write_raw_wr(txq, wr, m0, available);
+			n = write_raw_wr(txq, (void *)wr, m0, available);
 		} else {
 			total++;
 			remaining--;
@@ -4402,17 +4402,17 @@ write_raw_wr(struct sge_txq *txq, void *wr, struct mbuf *m0, u_int available)
 {
 	struct sge_eq *eq = &txq->eq;
 	struct tx_sdesc *txsd;
+	struct mbuf *m;
+	caddr_t dst;
 	int len16, ndesc;
 
 	len16 = mbuf_len16(m0);
 	ndesc = howmany(len16, EQ_ESIZE / 16);
 	MPASS(ndesc <= available);
 
-	/*
-	 * XXX: What to do about wrapping?  None of the other routines seem
-	 * to deal with wrapping around the end of the descriptor ring.
-	 */
-	m_copydata(m0, 0, m0->m_pkthdr.len, wr);
+	dst = wr;
+	for (m = m0; m != NULL; m = m->m_next)
+		copy_to_txd(eq, mtod(m, caddr_t), &dst, m->m_len);
 
 	txq->raw_wrs++;
 
