@@ -44,6 +44,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/systm.h>
 #include <netinet/in.h>
 #include <netinet/in_pcb.h>
+#ifdef KERN_TLS
+#include <netinet/ip.h>
+#endif
 #include <netinet/tcp_var.h>
 #include <netinet/toecore.h>
 #ifdef KERN_TLS
@@ -1769,11 +1772,24 @@ sbtls_act_open_rpl(struct adapter *sc, struct toepcb *toep, u_int status,
 	INP_WUNLOCK(inp);
 }
 
+static void
+write_set_tcb_field(struct toepcb *toep, void *dst, uint16_t word,
+    uint64_t mask, uint64_t val)
+{
+	struct cpl_set_tcb_field *cpl;
+
+	cpl = dst;
+	INIT_TP_WR_MIT_CPL(cpl, CPL_SET_TCB_FIELD, toep->tid);
+	cpl->reply_ctrl = htobe16(F_NO_REPLY);
+	cpl->word_cookie = htobe16(V_WORD(word));
+	cpl->mask = htobe64(mask);
+	cpl->val = htobe64(val);
+}
+
 static int
 sbtls_set_tcb_field(struct toepcb *toep, struct sge_txq *txq, uint16_t word,
     uint64_t mask, uint64_t val)
 {
-	struct cpl_set_tcb_field *cpl;
 	struct mbuf *m;
 	void *items[1];
 	int error;
@@ -1781,12 +1797,7 @@ sbtls_set_tcb_field(struct toepcb *toep, struct sge_txq *txq, uint16_t word,
 	m = alloc_wr_mbuf(sizeof(struct cpl_set_tcb_field), M_NOWAIT);
 	if (m == NULL)
 		return (ENOMEM);
-	cpl = mtod(m, void *);
-	INIT_TP_WR_MIT_CPL(cpl, CPL_SET_TCB_FIELD, toep->tid);
-	cpl->reply_ctrl = htobe16(F_NO_REPLY);
-	cpl->word_cookie = htobe16(V_WORD(word));
-	cpl->mask = htobe64(mask);
-	cpl->val = htobe64(val);
+	write_set_tcb_field(toep, mtod(m, void *), word, mask, val);
 	items[0] = m;
 	error = mp_ring_enqueue(txq->r, items, 1, 1);
 	if (error)
@@ -2208,8 +2219,35 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 {
 	struct mbuf_ext_pgs *ext_pgs;
 	struct tls_record_layer *hdr;
+	struct ether_header *eh;
+	struct ip *ip;
+	struct tcphdr *tcp;
 	struct mbuf *m_tls;
 	u_int nsegs, plen, wr_len;
+
+	/*
+	 * Locate headers in initial mbuf.
+	 * XXX: This assumes all of the headers are in the initial mbuf.
+	 * Could perhaps use m_advance() like parse_pkt() if that turns
+	 * out to be true.
+	 */
+	M_ASSERTPKTHDR(m);
+	if (m->m_len <= sizeof(*eh) + sizeof(*ip))
+		return (EINVAL);
+	eh = mtod(m, struct ether_header *);
+	if (ntohs(eh->ether_type) == ETHERTYPE_IP)
+		return (EINVAL);
+	m->m_pkthdr.l2hlen = sizeof(*eh);
+
+	/* XXX: Reject unsupported IP options? */
+	ip = (struct ip *)(eh + 1);
+	m->m_pkthdr.l3hlen = ip->ip_hl * 4;
+	if (m->m_len <= m->m_pkthdr.l2hlen + m->m_pkthdr.l3hlen +
+	    sizeof(*tcp))
+		return (EINVAL);
+	tcp = (struct tcphdr *)((char *)ip + m->m_pkthdr.l3hlen);
+	m->m_pkthdr.l4hlen = tcp->th_off * 4;
+	/* XXX: Reject unsupported TCP options? */
 
 	/* Find the TLS record. */
 	for (m_tls = m;; m_tls = m_tls->m_next)
@@ -2257,16 +2295,84 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	 * Include room for up to 5 SET_TCB requests before the real
 	 * work request.
 	 */
-	wr_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field, 16));
+	wr_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
 	*len16p = wr_len / 16;
 	return (0);
 }
+
+static void *
+txq_advance(struct sge_txq *txq, void *wr, u_int len)
+{
+	struct sge_eq *eq = &txq->eq;
+	uintptr_t ptr = (uintptr_t)wr;
+	uintptr_t start = (uintptr_t)&eq->desc[0];
+	uintptr_t end = (uintptr_t)&eq->desc[eq->sidx];
+
+	MPASS(ptr >= start);
+	MPASS(ptr < end);
+	KASSERT(ptr + len <= end, ("%s: previous item overran txq", __func__));
+
+	if (__predict_true(ptr + len < end))
+		return ((void *)(ptr + len));
+	else
+		return ((void *)start);
+}
+
+_Static_assert(sizeof(struct cpl_set_tcb_field) <= EQ_ESIZE,
+    "CPL_SET_TCB_FIELD must be smaller than a single TX descriptor");
 
 static int
 sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *wr,
     struct mbuf *m, u_int nsegs, u_int available)
 {
+	struct toepcb *toep;
+	struct mbuf_ext_pgs *ext_pgs;
+	struct tls_record_layer *hdr;
+	struct tcphdr *tcp;
+	struct mbuf *m_tls;
+	u_int ndesc, tcp_seqno;
+
+	ndesc = 0;
+	toep = cipher->toep;
+	MPASS(cipher->txq == txq);
+
+	/* Find the TLS record. */
+	for (m_tls = m;; m_tls = m_tls->m_next)
+		if (m_tls->m_flags & M_NOMAP)
+			break;
+
+	/* Determine the TCP sequence number of the start of the record. */
+	tcp = (struct tcphdr *)(mtod(m, char *) + m->m_pkthdr.l2hlen +
+	    m->m_pkthdr.l3hlen);
+	tcp_seqno = ntohl(tcp->th_seq) - mtod(m, vm_offset_t);
+
 	/* Flesh out TLS header */
+	ext_pgs = (void *)m->m_ext.ext_buf;
+	hdr = (void *)ext_pgs->hdr;
+	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
+
+	/* Update TCB fields. */
+	write_set_tcb_field(toep, wr, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX),
+	    V_TCB_TX_MAX(tcp_seqno));
+	wr = txq_advance(txq, wr, EQ_ESIZE);
+	ndesc++;
+	write_set_tcb_field(toep, wr, W_TCB_SND_NXT_RAW,
+	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW), V_TCB_SND_NXT_RAW(0));
+	wr = txq_advance(txq, wr, EQ_ESIZE);
+	ndesc++;
+	write_set_tcb_field(toep, wr, W_TCB_SND_MAX_RAW,
+	    V_TCB_SND_MAX_RAW(M_TCB_SND_MAX_RAW), V_TCB_SND_MAX_RAW(0));
+	wr = txq_advance(txq, wr, EQ_ESIZE);
+	ndesc++;
+	write_set_tcb_field(toep, wr, W_TCB_SND_UNA_RAW,
+	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW), V_TCB_SND_UNA_RAW(0));
+	wr = txq_advance(txq, wr, EQ_ESIZE);
+	ndesc++;
+	write_set_tcb_field(toep, wr, W_TCB_RCV_NXT,
+	    V_TCB_RCV_NXT(M_TCB_RCV_NXT), V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
+	wr = txq_advance(txq, wr, EQ_ESIZE);
+	ndesc++;
+
 	panic("%s", __func__);
 }
 
@@ -2304,7 +2410,7 @@ struct sbtls_crypto_backend t6tls_backend = {
 	.clean_cipher = t6_sbtls_clean_cipher
 };
 #endif
-	
+
 void
 t4_tls_mod_load(void)
 {
