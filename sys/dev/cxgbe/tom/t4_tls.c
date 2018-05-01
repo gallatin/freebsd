@@ -60,6 +60,9 @@ __FBSDID("$FreeBSD$");
 #include "tom/t4_tom_l2t.h"
 #include "tom/t4_tom.h"
 #include "t4_mp_ring.h"
+#ifdef KERN_TLS
+#include "crypto/t4_crypto.h"
+#endif
 
 /*
  * The TCP sequence number of a CPL_TLS_DATA mbuf is saved here while
@@ -2029,20 +2032,19 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	k_ctx = &tls_ofld->k_ctx;
 	init_sbtls_k_ctx(k_ctx, en, tls);
 
-	tls_ofld->scmd0.seqno_numivs =
-		(V_SCMD_SEQ_NO_CTRL(3) |
-		 V_SCMD_PROTO_VERSION(get_proto_ver(k_ctx->proto_ver)) |
-		 V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
-		 V_SCMD_CIPH_AUTH_SEQ_CTRL((k_ctx->mac_first == 0)) |
-		 V_SCMD_CIPH_MODE(k_ctx->state.enc_mode) |
-		 V_SCMD_AUTH_MODE(k_ctx->state.auth_mode) |
-		 V_SCMD_HMAC_CTRL(k_ctx->hmac_ctrl) |
-		 V_SCMD_IV_SIZE(k_ctx->iv_size));
+	tls_ofld->scmd0.seqno_numivs = htobe32(V_SCMD_SEQ_NO_CTRL(3) |
+	    V_SCMD_PROTO_VERSION(get_proto_ver(k_ctx->proto_ver)) |
+	    V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
+	    V_SCMD_CIPH_AUTH_SEQ_CTRL((k_ctx->mac_first == 0)) |
+	    V_SCMD_CIPH_MODE(k_ctx->state.enc_mode) |
+	    V_SCMD_AUTH_MODE(k_ctx->state.auth_mode) |
+	    V_SCMD_HMAC_CTRL(k_ctx->hmac_ctrl) |
+	    V_SCMD_IV_SIZE(k_ctx->iv_size) | V_SCMD_NUM_IVS(1));
 
-	tls_ofld->scmd0.ivgen_hdrlen =
-		(V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
-		 V_SCMD_KEY_CTX_INLINE(0) |
-		 V_SCMD_TLS_FRAG_ENABLE(1));
+	tls_ofld->scmd0.ivgen_hdrlen = htobe32(
+	    V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
+	    V_SCMD_KEY_CTX_INLINE(0) |
+	    V_SCMD_TLS_FRAG_ENABLE(0));
 
 	tls_ofld->mac_length = k_ctx->mac_secret_size;
 
@@ -2063,18 +2065,6 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 			 tls_ofld->k_ctx.frag_size);
 	}
 #endif
-
-	/*
-	 * XXX: Set function pointer for M_TLS handler to function in
-	 * this module perhaps either overloading sb_tls_crypt or more
-	 * likely as a new member of cipher.  Probably useful to leave
-	 * sb_tls_crypt NULL to catch bugs.
-	 *
-	 * Probably need two function pointers, one for parse_pkt()
-	 * that sets len16 (parse_pkt can probably handle nsegs for
-	 * us) and then a callback from eth_tx to construct the actual
-	 * work request.
-	 */
 
 	if (en->crypt_algorithm == CRYPTO_AES_NIST_GCM_16) {
 		tls->sb_params.sb_tls_hlen = TLS_HEADER_LENGTH +
@@ -2213,6 +2203,33 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	}
 }
 
+static u_int
+sbtls_base_wr_size(struct toepcb *toep)
+{
+	u_int wr_len;
+
+	wr_len = sizeof(struct fw_ulptx_wr);	// 16
+	wr_len += sizeof(struct ulp_txpkt);	// 8
+	wr_len += sizeof(struct ulptx_idata);	// 8
+	wr_len += sizeof(struct cpl_tx_sec_pdu);// 32
+	wr_len += key_size(toep);		// 16
+	wr_len += sizeof(struct cpl_tx_data);	// 16
+	return (wr_len);
+}
+
+static u_int
+sbtls_sgl_size(u_int nsegs)
+{
+	u_int wr_len;
+
+	/* First segment is part of ulptx_sgl. */
+	nsegs--;
+
+	wr_len = sizeof(struct ulptx_sgl);
+	wr_len += 8 * ((3 * nsegs) / 2 + (nsegs & 1));
+	return (wr_len);
+}
+
 static int
 sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
     int *len16p)
@@ -2223,7 +2240,7 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	struct ip *ip;
 	struct tcphdr *tcp;
 	struct mbuf *m_tls;
-	u_int nsegs, plen, wr_len;
+	u_int plen, wr_len;
 
 	/*
 	 * Locate headers in initial mbuf.
@@ -2247,6 +2264,7 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		return (EINVAL);
 	tcp = (struct tcphdr *)((char *)ip + m->m_pkthdr.l3hlen);
 	m->m_pkthdr.l4hlen = tcp->th_off * 4;
+
 	/* XXX: Reject unsupported TCP options? */
 
 	/* Find the TLS record. */
@@ -2262,12 +2280,8 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	hdr = (void *)ext_pgs->hdr;
 	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
 
-	wr_len = sizeof(struct fw_ulptx_wr);	// 16
-	wr_len += sizeof(struct ulp_txpkt);	// 8
-	wr_len += sizeof(struct ulptx_idata);	// 8
-	wr_len += sizeof(struct cpl_tx_sec_pdu);// 32
-	wr_len += key_size(cipher->toep);	// 16
-	wr_len += sizeof(struct cpl_tx_data);	// 16
+	/* Calculate the size of the work request. */
+	wr_len = sbtls_base_wr_size(cipher->toep);
 	/* XXX: immediate data eventually */
 #ifdef notyet
 	if (plen <= SGE_MAX_WR_LEN - wr_len) {
@@ -2280,15 +2294,10 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		/* XXX: eventually make tls_hdr always immediate? */
 		*nsegsp = sglist_count_ext_pgs(ext_pgs, 0, plen);
 
-		/* First segment is part of ulptx_sgl. */
-		nsegs = *nsegsp - 1;
-
-		wr_len += sizeof(struct ulptx_sgl);
-		wr_len += 8 * ((3 * nsegs) / 2 + (nsegs & 1));
+		wr_len += sbtls_sgl_size(*nsegsp);
 	}
-
 	wr_len = roundup2(wr_len, 16);
-	if (wr_len > SGE_MAX_WR_LEN)
+	if (wr_len > SGE_MAX_WR_LEN || *nsegsp > TX_SGL_SEGS)
 		return (EFBIG);
 
 	/*
@@ -2318,19 +2327,123 @@ txq_advance(struct sge_txq *txq, void *wr, u_int len)
 		return ((void *)start);
 }
 
+static __be64
+get_flit(struct sglist_seg *segs, int nsegs, int idx)
+{
+	int i = (idx / 3) * 2;
+
+	switch (idx % 3) {
+	case 0: {
+		uint64_t rc;
+
+		rc = (uint64_t)segs[i].ss_len << 32;
+		if (i + 1 < nsegs)
+			rc |= (uint64_t)(segs[i + 1].ss_len);
+
+		return (htobe64(rc));
+	}
+	case 1:
+		return (htobe64(segs[i].ss_paddr));
+	case 2:
+		return (htobe64(segs[i + 1].ss_paddr));
+	}
+
+	return (0);
+}
+
+/*
+ * If the SGL ends on an address that is not 16 byte aligned, this function will
+ * add a 0 filled flit at the end.
+ */
+static void
+write_gl_to_txd(struct sge_txq *txq, caddr_t to)
+{
+	struct sge_eq *eq = &txq->eq;
+	struct sglist *gl = txq->gl;
+	struct sglist_seg *seg;
+	__be64 *flitp, *wrap;
+	struct ulptx_sgl *usgl;
+	int i, nflits, nsegs;
+
+	KASSERT(((uintptr_t)to & 0xf) == 0,
+	    ("%s: SGL must start at a 16 byte boundary: %p", __func__, to));
+	MPASS((uintptr_t)to >= (uintptr_t)&eq->desc[0]);
+	MPASS((uintptr_t)to < (uintptr_t)&eq->desc[eq->sidx]);
+
+	nsegs = gl->sg_nseg;
+	MPASS(nsegs > 0);
+
+	nflits = (3 * (nsegs - 1)) / 2 + ((nsegs - 1) & 1) + 2;
+	flitp = (__be64 *)to;
+	wrap = (__be64 *)(&eq->desc[eq->sidx]);
+	seg = &gl->sg_segs[0];
+	usgl = (void *)flitp;
+
+	/*
+	 * We start at a 16 byte boundary somewhere inside the tx descriptor
+	 * ring, so we're at least 16 bytes away from the status page.  There is
+	 * no chance of a wrap around in the middle of usgl (which is 16 bytes).
+	 */
+
+	usgl->cmd_nsge = htobe32(V_ULPTX_CMD(ULP_TX_SC_DSGL) |
+	    V_ULPTX_NSGE(nsegs));
+	usgl->len0 = htobe32(seg->ss_len);
+	usgl->addr0 = htobe64(seg->ss_paddr);
+	seg++;
+
+	if ((uintptr_t)(flitp + nflits) <= (uintptr_t)wrap) {
+
+		/* Won't wrap around at all */
+
+		for (i = 0; i < nsegs - 1; i++, seg++) {
+			usgl->sge[i / 2].len[i & 1] = htobe32(seg->ss_len);
+			usgl->sge[i / 2].addr[i & 1] = htobe64(seg->ss_paddr);
+		}
+		if (i & 1)
+			usgl->sge[i / 2].len[1] = htobe32(0);
+		flitp += nflits;
+	} else {
+
+		/* Will wrap somewhere in the rest of the SGL */
+
+		/* 2 flits already written, write the rest flit by flit */
+		flitp = (void *)(usgl + 1);
+		for (i = 0; i < nflits - 2; i++) {
+			if (flitp == wrap)
+				flitp = (void *)eq->desc;
+			*flitp++ = get_flit(seg, nsegs - 1, i);
+		}
+	}
+
+	if (nflits & 1) {
+		MPASS(((uintptr_t)flitp) & 0xf);
+		*flitp++ = 0;
+	}
+
+	MPASS((((uintptr_t)flitp) & 0xf) == 0);
+}
+
 _Static_assert(sizeof(struct cpl_set_tcb_field) <= EQ_ESIZE,
     "CPL_SET_TCB_FIELD must be smaller than a single TX descriptor");
 
 static int
-sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *wr,
+sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
     struct mbuf *m, u_int nsegs, u_int available)
 {
 	struct toepcb *toep;
+	struct fw_ulptx_wr *wr;
+	struct ulp_txpkt *txpkt;
+	struct ulptx_idata *idata;
+	struct cpl_tx_sec_pdu *sec_pdu;
+	struct cpl_tx_data *tx_data;
 	struct mbuf_ext_pgs *ext_pgs;
 	struct tls_record_layer *hdr;
 	struct tcphdr *tcp;
 	struct mbuf *m_tls;
-	u_int ndesc, tcp_seqno;
+	u_int aad_start, aad_stop;
+	u_int auth_start, auth_stop, auth_insert;
+	u_int cipher_start, cipher_stop;
+	u_int imm_len, mss, ndesc, plen, tcp_seqno, wr_len;
 
 	ndesc = 0;
 	toep = cipher->toep;
@@ -2352,28 +2465,148 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *wr,
 	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
 
 	/* Update TCB fields. */
-	write_set_tcb_field(toep, wr, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX),
+	write_set_tcb_field(toep, dst, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX),
 	    V_TCB_TX_MAX(tcp_seqno));
-	wr = txq_advance(txq, wr, EQ_ESIZE);
+	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
-	write_set_tcb_field(toep, wr, W_TCB_SND_NXT_RAW,
+	write_set_tcb_field(toep, dst, W_TCB_SND_NXT_RAW,
 	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW), V_TCB_SND_NXT_RAW(0));
-	wr = txq_advance(txq, wr, EQ_ESIZE);
+	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
-	write_set_tcb_field(toep, wr, W_TCB_SND_MAX_RAW,
+	write_set_tcb_field(toep, dst, W_TCB_SND_MAX_RAW,
 	    V_TCB_SND_MAX_RAW(M_TCB_SND_MAX_RAW), V_TCB_SND_MAX_RAW(0));
-	wr = txq_advance(txq, wr, EQ_ESIZE);
+	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
-	write_set_tcb_field(toep, wr, W_TCB_SND_UNA_RAW,
+	write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
 	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW), V_TCB_SND_UNA_RAW(0));
-	wr = txq_advance(txq, wr, EQ_ESIZE);
+	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
-	write_set_tcb_field(toep, wr, W_TCB_RCV_NXT,
+	write_set_tcb_field(toep, dst, W_TCB_RCV_NXT,
 	    V_TCB_RCV_NXT(M_TCB_RCV_NXT), V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
-	wr = txq_advance(txq, wr, EQ_ESIZE);
+	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 
-	panic("%s", __func__);
+	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
+
+	/* Calculate the size of the work request. */
+	wr_len = sbtls_base_wr_size(cipher->toep);
+	/* XXX: immediate data eventually */
+#ifdef notyet
+	if (nsegs == 0) {
+		MPASS(plen <= SGE_MAX_WR_LEN - wr_len);
+		wr_len += plen;
+		imm_len = plen;
+	} else {
+#else
+	{
+#endif
+		wr_len += sbtls_sgl_size(nsegs);
+		imm_len = 0;
+	}
+	wr_len = roundup2(wr_len, 16);
+	MPASS(ndesc + howmany(wr_len, EQ_ESIZE) <= available);
+
+	/* FW_ULPTX_WR */
+	wr = dst;
+	wr->op_to_compl = htobe32(V_FW_WR_OP(FW_ULPTX_WR));
+	wr->flowid_len16 = htobe32(F_FW_ULPTX_WR_DATA |
+	    V_FW_WR_LEN16(wr_len / 16));
+	wr->cookie = 0;
+
+	/* ULP_TXPKT */
+	txpkt = txq_advance(txq, wr, sizeof(*wr));
+	txpkt->cmd_dest = htobe32(V_ULPTX_CMD(ULP_TX_PKT) |
+	    V_ULP_TXPKT_DATAMODIFY(0) |
+	    V_ULP_TXPKT_CHANNELID(toep->vi->pi->port_id) | V_ULP_TXPKT_DEST(0) |
+	    V_ULP_TXPKT_FID(txq->eq.cntxt_id) | V_ULP_TXPKT_RO(1));
+	txpkt->len = htobe32((wr_len - sizeof(*wr)) / 16);
+
+	/* ULPTX_IDATA sub-command */
+	idata = txq_advance(txq, txpkt, sizeof(*txpkt));
+	idata->cmd_more = htobe32(V_ULPTX_CMD(ULP_TX_SC_IMM) |
+	    V_ULP_TX_SC_MORE(imm_len != 0 ? 0 : 1));
+	idata->len = htobe32(sizeof(struct cpl_tx_sec_pdu) + key_size(toep) +
+	    sizeof(struct cpl_tx_data) + imm_len);
+
+	/* CPL_TX_SEC_PDU */
+	/* XXX: Not sure about TX_SEC_PDU_PLACEHOLDER */
+	sec_pdu = txq_advance(txq, idata, sizeof(*idata));
+	sec_pdu->op_ivinsrtofst = htobe32(
+	    V_CPL_TX_SEC_PDU_OPCODE(CPL_TX_SEC_PDU) |
+	    V_CPL_TX_SEC_PDU_CPLLEN(2) | V_CPL_TX_SEC_PDU_PLACEHOLDER(1) |
+	    V_CPL_TX_SEC_PDU_IVINSRTOFST(TLS_HEADER_LENGTH + 1));
+
+	sec_pdu->pldlen = htobe32(plen);
+
+	/*
+	 * AAD is TLS header.  IV is after AAD.  The cipher region
+	 * starts after the IV.  See comments in ccr_authenc() and
+	 * ccr_gmac() in t4_crypto.c regarding cipher and auth
+	 * start/stop values.
+	 */
+	aad_start = 1;
+	aad_stop = TLS_HEADER_LENGTH;
+	cipher_start = ext_pgs->hdr_len + 1;
+	if (toep->tls.k_ctx.state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
+		cipher_stop = 0;
+		auth_start = cipher_start;
+		auth_stop = GCM_TAG_SIZE;
+		auth_insert = GCM_TAG_SIZE;
+	} else {
+		/* XXX: This might not be quite right due to padding. */
+		cipher_stop = ext_pgs->trail_len;
+		auth_start = cipher_start;
+		auth_stop = cipher_stop;
+		auth_insert = ext_pgs->trail_len;
+	}
+	sec_pdu->aadstart_cipherstop_hi = htobe32(
+	    V_CPL_TX_SEC_PDU_AADSTART(aad_start) |
+	    V_CPL_TX_SEC_PDU_AADSTOP(aad_stop) |
+	    V_CPL_TX_SEC_PDU_CIPHERSTART(cipher_start) |
+	    V_CPL_TX_SEC_PDU_CIPHERSTOP_HI(cipher_stop >> 4));
+	sec_pdu->cipherstop_lo_authinsert = htobe32(
+	    V_CPL_TX_SEC_PDU_CIPHERSTOP_LO(cipher_stop & 0xf) |
+	    V_CPL_TX_SEC_PDU_AUTHSTART(auth_start) |
+	    V_CPL_TX_SEC_PDU_AUTHSTOP(auth_stop) |
+	    V_CPL_TX_SEC_PDU_AUTHINSERT(auth_insert));
+
+	/* These two flits are actually a CPL_TLS_TX_SCMD_FMT. */
+	sec_pdu->seqno_numivs = toep->tls.scmd0.seqno_numivs;
+	sec_pdu->ivgen_hdrlen = toep->tls.scmd0.ivgen_hdrlen;
+
+	/* XXX: Ok to reuse TLS sequence number? */
+	sec_pdu->scmd1 = htobe64(ext_pgs->seqno);
+
+	/* Key context */
+	dst = txq_advance(txq, sec_pdu, sizeof(*sec_pdu));
+	tls_copy_tx_key(toep, dst);
+
+	/* CPL_TX_DATA */
+	tx_data = txq_advance(txq, dst, key_size(toep));
+	OPCODE_TID(tx_data) = htonl(MK_OPCODE_TID(CPL_TX_DATA, toep->tid));
+	mss = toep->vi->ifp->if_mtu - (m->m_pkthdr.l3hlen + m->m_pkthdr.l4hlen);
+	tx_data->len = V_TX_DATA_MSS(mss) |
+	    V_TX_LENGTH(plen + ext_pgs->trail_len);
+	tx_data->rsvd = htobe32(tcp_seqno);
+	tx_data->flags = htobe32(F_TX_BYPASS);
+
+	dst = txq_advance(txq, tx_data, sizeof(*tx_data));
+	if (imm_len != 0) {
+		panic("TODO: copy immediate data");
+	} else {
+		sglist_reset(txq->gl);
+		if (sglist_append_ext_pgs(txq->gl, ext_pgs, 0, plen) != 0) {
+#ifdef INVARIANTS
+			panic("%s: failed to append sglist", __func__);
+#endif
+		}
+		write_gl_to_txd(txq, dst);
+	}
+
+	ndesc += howmany(wr_len, EQ_ESIZE);
+	MPASS(ndesc <= available);
+
+	return (ndesc);
 }
 
 static void
