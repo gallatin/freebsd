@@ -666,6 +666,13 @@ struct fw_ulptx_wr {
 	__u64  cookie;
 };
 
+#define S_FW_ULPTX_WR_DATA	28
+#define M_FW_ULPTX_WR_DATA	0x1
+#define V_FW_ULPTX_WR_DATA(x)	((x) << S_FW_ULPTX_WR_DATA)
+#define G_FW_ULPTX_WR_DATA(x)	\
+    (((x) >> S_FW_ULPTX_WR_DATA) & M_FW_ULPTX_WR_DATA)
+#define F_FW_ULPTX_WR_DATA	V_FW_ULPTX_WR_DATA(1U)
+
 struct fw_tp_wr {
 	__be32 op_to_immdlen;
 	__be32 flowid_len16;
