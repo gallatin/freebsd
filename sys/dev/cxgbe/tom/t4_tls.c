@@ -2286,7 +2286,7 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		return (EINVAL);
 	}
 	eh = mtod(m, struct ether_header *);
-	if (ntohs(eh->ether_type) == ETHERTYPE_IP) {
+	if (ntohs(eh->ether_type) != ETHERTYPE_IP) {
 		CTR2(KTR_CXGBE, "%s: tid %d mbuf not ETHERTYPE_IP", __func__,
 		    cipher->toep->tid);
 		return (EINVAL);
