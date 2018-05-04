@@ -2324,7 +2324,8 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	 * Determine the size of the entire TLS record payload
 	 * excluding the trailer.
 	 */
-	ext_pgs = (void *)m->m_ext.ext_buf;
+	MBUF_EXT_PGS_ASSERT(m_tls);
+	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	hdr = (void *)ext_pgs->hdr;
 	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
 
