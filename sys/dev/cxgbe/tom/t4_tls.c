@@ -2513,7 +2513,8 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	tcp_seqno = ntohl(tcp->th_seq) - mtod(m_tls, vm_offset_t);
 
 	/* Flesh out TLS header */
-	ext_pgs = (void *)m->m_ext.ext_buf;
+	MBUF_EXT_PGS_ASSERT(m_tls);
+	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	hdr = (void *)ext_pgs->hdr;
 	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
 
