@@ -52,6 +52,9 @@ __FBSDID("$FreeBSD$");
 #ifdef KERN_TLS
 #include <opencrypto/cryptodev.h>
 #include <opencrypto/xform.h>
+#include <vm/vm.h> /* XXX */
+#include <vm/pmap.h> /* XXX */
+#include <vm/vm_param.h> /* XXX */
 #endif
 
 #ifdef TCP_OFFLOAD
@@ -1647,6 +1650,28 @@ do_rx_tls_cmp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 }
 
 #ifdef KERN_TLS
+SYSCTL_NODE(_debug, OID_AUTO, t6tls, CTLFLAG_RD, 0, "T6 TLS");
+
+static char tls_key[MAX_CIPHER_KSZ];
+SYSCTL_OPAQUE(_debug_t6tls, OID_AUTO, key, CTLFLAG_RD, tls_key, sizeof(tls_key),
+    "S", "Last cipher key");
+
+static int tls_key_len;
+SYSCTL_INT(_debug_t6tls, OID_AUTO, key_len, CTLFLAG_RD, &tls_key_len, 0,
+    "Last cipher key length");
+
+static char tls_iv[SALT_SIZE];
+SYSCTL_OPAQUE(_debug_t6tls, OID_AUTO, iv, CTLFLAG_RD, tls_iv, sizeof(tls_iv),
+    "S", "Last IV (salt)");
+
+static char tls_record[16384];
+SYSCTL_OPAQUE(_debug_t6tls, OID_AUTO, record, CTLFLAG_RD, tls_record,
+    sizeof(tls_record), "S", "Last plaintext record ommitting trailer");
+
+static int tls_record_len;
+SYSCTL_INT(_debug_t6tls, OID_AUTO, record_len, CTLFLAG_RD, &tls_record_len, 0,
+    "Last record length");
+
 static struct protosw *tcp_protosw;
 
 static int sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m,
@@ -2153,6 +2178,12 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 #endif
 	}
 
+#if 1
+	memcpy(tls_key, tls->sb_params.crypt, tls->sb_params.crypt_key_len);
+	tls_key_len = tls->sb_params.crypt_key_len;
+	memcpy(tls_iv, tls->sb_params.iv, SALT_SIZE);
+#endif
+
 	keyid = tls_ofld->tx_key_addr;
 
 	/* Populate key work request. */
@@ -2246,22 +2277,36 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	 * Locate headers in initial mbuf.
 	 * XXX: This assumes all of the headers are in the initial mbuf.
 	 * Could perhaps use m_advance() like parse_pkt() if that turns
-	 * out to be true.
+	 * out to not be true.
 	 */
 	M_ASSERTPKTHDR(m);
-	if (m->m_len <= sizeof(*eh) + sizeof(*ip))
+	if (m->m_len <= sizeof(*eh) + sizeof(*ip)) {
+		CTR2(KTR_CXGBE, "%s: tid %d header mbuf too short", __func__,
+		    cipher->toep->tid);
 		return (EINVAL);
+	}
 	eh = mtod(m, struct ether_header *);
-	if (ntohs(eh->ether_type) == ETHERTYPE_IP)
+	if (ntohs(eh->ether_type) == ETHERTYPE_IP) {
+		CTR2(KTR_CXGBE, "%s: tid %d mbuf not ETHERTYPE_IP", __func__,
+		    cipher->toep->tid);
 		return (EINVAL);
+	}
 	m->m_pkthdr.l2hlen = sizeof(*eh);
 
 	/* XXX: Reject unsupported IP options? */
 	ip = (struct ip *)(eh + 1);
+	if (ip->ip_p != IPPROTO_TCP) {
+		CTR2(KTR_CXGBE, "%s: tid %d mbuf not IPPROTO_TCP", __func__,
+		    cipher->toep->tid);
+		return (EINVAL);
+	}
 	m->m_pkthdr.l3hlen = ip->ip_hl * 4;
 	if (m->m_len <= m->m_pkthdr.l2hlen + m->m_pkthdr.l3hlen +
-	    sizeof(*tcp))
+	    sizeof(*tcp)) {
+		CTR2(KTR_CXGBE, "%s: tid %d header mbuf too short (2)",
+		    __func__, cipher->toep->tid);
 		return (EINVAL);
+	}
 	tcp = (struct tcphdr *)((char *)ip + m->m_pkthdr.l3hlen);
 	m->m_pkthdr.l4hlen = tcp->th_off * 4;
 
@@ -2271,6 +2316,9 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	for (m_tls = m;; m_tls = m_tls->m_next)
 		if (m_tls->m_flags & M_NOMAP)
 			break;
+
+	/* Assume all headers are in 'm' for now. */
+	MPASS(m->m_next == m_tls);
 
 	/*
 	 * Determine the size of the entire TLS record payload
@@ -2297,6 +2345,8 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		wr_len += sbtls_sgl_size(*nsegsp);
 	}
 	wr_len = roundup2(wr_len, 16);
+	CTR4(KTR_CXGBE, "%s: tid %d wr_len %d nsegs %d", __func__,
+	    cipher->toep->tid, wr_len, *nsegsp);
 	if (wr_len > SGE_MAX_WR_LEN || *nsegsp > TX_SGL_SEGS)
 		return (EFBIG);
 
@@ -2306,6 +2356,8 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	 */
 	wr_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
 	*len16p = wr_len / 16;
+	CTR3(KTR_CXGBE, "%s: tid %d len16 %d", __func__,
+	    cipher->toep->tid, *len16p);
 	return (0);
 }
 
@@ -2488,6 +2540,32 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 
 	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
 
+#if 1
+	{
+		int i, off, pgoff;
+
+		memcpy(tls_record, ext_pgs->hdr, ext_pgs->hdr_len);
+		off = ext_pgs->hdr_len;
+		pgoff = ext_pgs->first_pg_off;
+		for (i = 0; i < ext_pgs->npgs; i++)
+		{
+			int pglen, tocopy;
+
+			pglen = mbuf_ext_pg_len(ext_pgs, i, pgoff);
+			tocopy = pglen;
+			if (tocopy < sizeof(tls_record) - off)
+				tocopy = sizeof(tls_record) - off;
+			memcpy(tls_record + off,
+			    (void *)(uintptr_t)(PHYS_TO_DMAP(ext_pgs->pa[i]) + pgoff),
+			    tocopy);
+			pgoff = 0;
+			off += tocopy;
+			if (off == sizeof(tls_record))
+				break;
+		}
+		tls_record_len = off;
+	}
+#endif
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
 	/* XXX: immediate data eventually */
