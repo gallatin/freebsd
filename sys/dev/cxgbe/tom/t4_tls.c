@@ -2509,7 +2509,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	/* Determine the TCP sequence number of the start of the record. */
 	tcp = (struct tcphdr *)(mtod(m, char *) + m->m_pkthdr.l2hlen +
 	    m->m_pkthdr.l3hlen);
-	tcp_seqno = ntohl(tcp->th_seq) - mtod(m, vm_offset_t);
+	tcp_seqno = ntohl(tcp->th_seq) - mtod(m_tls, vm_offset_t);
 
 	/* Flesh out TLS header */
 	ext_pgs = (void *)m->m_ext.ext_buf;
