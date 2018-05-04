@@ -599,7 +599,7 @@ abort_fatal(struct trapframe *tf, u_int idx, u_int fsr, u_int far,
 	printf(", pc =%08x\n\n", tf->tf_pc);
 
 #ifdef KDB
-	if (debugger_on_panic || kdb_active)
+	if (debugger_on_trap || kdb_active)
 		kdb_trap(fsr, 0, tf);
 #endif
 	panic("Fatal abort");

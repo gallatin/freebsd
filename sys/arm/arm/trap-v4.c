@@ -447,7 +447,7 @@ dab_fatal(struct trapframe *tf, u_int fsr, u_int far, struct thread *td,
 	printf(", pc =%08x\n\n", tf->tf_pc);
 
 #ifdef KDB
-	if (debugger_on_panic || kdb_active)
+	if (debugger_on_trap || kdb_active)
 		if (kdb_trap(fsr, 0, tf))
 			return (0);
 #endif

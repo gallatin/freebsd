@@ -1103,7 +1103,7 @@ err:
 #endif
 
 #ifdef KDB
-		if (debugger_on_panic || kdb_active) {
+		if (debugger_on_trap || kdb_active) {
 			kdb_trap(type, 0, trapframe);
 		}
 #endif

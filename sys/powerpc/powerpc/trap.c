@@ -437,7 +437,7 @@ trap_fatal(struct trapframe *frame)
 
 	printtrap(frame->exc, frame, 1, (frame->srr1 & PSL_PR));
 #ifdef KDB
-	if ((debugger_on_panic || kdb_active) &&
+	if ((debugger_on_trap || kdb_active) &&
 	    kdb_trap(frame->exc, 0, frame))
 		return;
 #endif
