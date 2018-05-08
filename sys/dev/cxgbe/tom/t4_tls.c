@@ -2483,6 +2483,8 @@ static int
 sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
     struct mbuf *m, u_int nsegs, u_int available)
 {
+	struct sge_eq *eq = &txq->eq;
+	struct tx_sdesc *txsd;
 	struct toepcb *toep;
 	struct fw_ulptx_wr *wr;
 	struct ulp_txpkt *txpkt;
@@ -2685,6 +2687,10 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 
 	ndesc += howmany(wr_len, EQ_ESIZE);
 	MPASS(ndesc <= available);
+
+	txsd = &txq->sdesc[eq->pidx];
+	txsd->m = m0;
+	txsd->desc_used = n;
 
 	return (ndesc);
 }
