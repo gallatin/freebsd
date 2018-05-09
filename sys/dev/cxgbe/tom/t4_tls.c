@@ -2742,8 +2742,8 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	MPASS(ndesc <= available);
 
 	txsd = &txq->sdesc[eq->pidx];
-	txsd->m = m0;
-	txsd->desc_used = n;
+	txsd->m = m;
+	txsd->desc_used = ndesc;
 
 	return (ndesc);
 }
