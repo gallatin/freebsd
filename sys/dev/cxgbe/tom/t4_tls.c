@@ -1722,7 +1722,7 @@ init_sbtls_k_ctx(struct tls_key_context *k_ctx, struct tls_so_enable *en,
 		k_ctx->tx_key_info_size += mac_key_size * 2;
 	}
 
-	k_ctx->iv_ctrl = 1;
+	k_ctx->iv_ctrl = 0;
 	k_ctx->iv_algo = 0;
 	k_ctx->frag_size = tls->sb_params.sb_maxlen;
 }
