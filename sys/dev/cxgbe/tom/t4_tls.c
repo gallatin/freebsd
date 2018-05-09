@@ -2597,6 +2597,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 
+	/* XXX: rcv_wnd? */
 #if 1
 	{
 		int i, off, pgoff;
