@@ -2571,6 +2571,8 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	MBUF_EXT_PGS_ASSERT(m_tls);
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	hdr = (void *)ext_pgs->hdr;
+	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
+	hdr->tls_length = htons(plen + ext_pgs->trail_len - TLS_HEADER_LENGTH);
 	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
 
 	/* Update TCB fields. */
@@ -2594,8 +2596,6 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	    V_TCB_RCV_NXT(M_TCB_RCV_NXT), V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
-
-	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
 
 #if 1
 	{
