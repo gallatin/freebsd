@@ -1967,6 +1967,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		goto failed;
 	}
 
+#ifdef KEY_IN_DDR
 	keyid = get_new_keyid(toep);
 	if (keyid < 0) {
 		error = ENOMEM;
@@ -1976,6 +1977,13 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	tls_ofld->tx_key_addr = keyid;
 	CTR3(KTR_CXGBE, "%s: atid %d allocated TX key addr %#x", __func__,
 	    toep->tid, tls_ofld->tx_key_addr);
+#else
+	keyid = -1;
+	tls_ofld = &toep->tls;
+	CTR2(KTR_CXGBE, "%s: atid %d using immediate key ctx", __func__,
+	    toep->tid);
+	tls_ofld->key_location = TLS_SFO_WR_CONTEXTLOC_IMMEDIATE;
+#endif
 
 	toep->inp = inp;
 	error = send_sbtls_act_open_req(sc, vi, so, toep);
@@ -2035,11 +2043,13 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	 */
 	len = roundup2(sizeof(struct tls_key_req), 16) +
 	    roundup2(sizeof(struct tls_keyctx), 32);
+#ifdef KEY_IN_DDR
 	key_wr = alloc_wr_mbuf(len, M_NOWAIT);
 	if (key_wr == NULL) {
 		error = ENOMEM;
 		goto failed;
 	}
+#endif
 
 	tls = sbtls_init_sb_tls(so, en, sizeof(struct t6_sbtls_cipher));
 	if (tls == NULL) {
@@ -2068,7 +2078,11 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 
 	tls_ofld->scmd0.ivgen_hdrlen = htobe32(
 	    V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
+#ifdef KEY_IN_DDR
 	    V_SCMD_KEY_CTX_INLINE(0) |
+#else
+	    V_SCMD_KEY_CTX_INLINE(1) |
+#endif
 	    V_SCMD_TLS_FRAG_ENABLE(0));
 
 	tls_ofld->mac_length = k_ctx->mac_secret_size;
@@ -2143,25 +2157,27 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	struct toepcb *toep = cipher->toep;
 	struct tls_ofld_info *tls_ofld = &toep->tls;
 	struct tls_key_context *k_ctx;
+#ifdef KEY_IN_DDR
 	int keyid, kwrlen, kctxlen, len;
 	struct tls_key_req *kwr;
 	struct tls_keyctx *kctx;
 	void *items[1];
+#else
+	struct tx_keyctx_hdr *khdr;
+	unsigned int ck_size, mk_size;
+#endif
 
 	/* INP_WLOCK_ASSERT(inp); */
 
 	/* Load keys into key context. */
 	k_ctx = &tls_ofld->k_ctx;
 	k_ctx->l_p_key = KEY_WRITE_TX;
-	if (tls->sb_params.iv == NULL) {
+	if (tls->sb_params.iv == NULL || tls->sb_params.crypt == NULL) {
 		*error = EINVAL;
 		return;
 	}
+#ifdef KEY_IN_DDR
 	memcpy(k_ctx->tx.salt, tls->sb_params.iv, SALT_SIZE);
-	if (tls->sb_params.crypt == NULL) {
-		*error = EINVAL;
-		return;
-	}
 	memcpy(k_ctx->tx.key, tls->sb_params.crypt,
 	    tls->sb_params.crypt_key_len);
 	if (k_ctx->state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
@@ -2177,6 +2193,41 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 		 */
 #endif
 	}
+#else
+	/*
+	 * For inline keys, store the full key context inline on top of
+	 * k_ctx->tx.  This is a bit of a gross hack, but safe because
+	 * there is room in k_ctx->rx for the overflow.
+	 */
+	khdr = (void *)&k_ctx->tx;
+	ck_size = k_ctx->cipher_secret_size;
+	mk_size = k_ctx->mac_secret_size;
+
+	khdr->ctxlen = (k_ctx->tx_key_info_size >> 4);
+	khdr->dualck_to_txvalid = V_TLS_KEYCTX_TX_WR_SALT_PRESENT(1) |
+	    V_TLS_KEYCTX_TX_WR_TXCK_SIZE(get_cipher_key_size(ck_size)) |
+	    V_TLS_KEYCTX_TX_WR_TXMK_SIZE(get_mac_key_size(mk_size)) |
+	    V_TLS_KEYCTX_TX_WR_TXVALID(1);
+	if (k_ctx->state.enc_mode != CH_EVP_CIPH_GCM_MODE)
+		khdr->dualck_to_txvalid |=
+		    V_TLS_KEYCTX_TX_WR_TXOPAD_PRESENT(1);
+	khdr->dualck_to_txvalid = htobe16(khdr->dualck_to_txvalid);
+	memcpy(khdr->txsalt, tls->sb_params.iv, SALT_SIZE);
+	memcpy(khdr + 1, tls->sb_params.crypt, tls->sb_params.crypt_key_len);
+	if (k_ctx->state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
+		init_sbtls_gmac_hash(tls->sb_params.crypt,
+		    tls->sb_params.crypt_key_len * 8,
+		    (char *)(khdr + 1) + tls->sb_params.crypt_key_len);
+#ifdef notyet
+	} else {
+		/* Generate ipad and opad and append after key. */
+		/*
+		 * XXX: Probably want to share ccr_init_hmac_digest
+		 * here rather than reimplementing.
+		 */
+#endif
+	}
+#endif
 
 #if 1
 	memcpy(tls_key, tls->sb_params.crypt, tls->sb_params.crypt_key_len);
@@ -2184,6 +2235,7 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 	memcpy(tls_iv, tls->sb_params.iv, SALT_SIZE);
 #endif
 
+#ifdef KEY_IN_DDR
 	keyid = tls_ofld->tx_key_addr;
 
 	/* Populate key work request. */
@@ -2232,6 +2284,7 @@ t6_sbtls_setup_cipher(struct sbtls_info *tls, int *error)
 		cipher->key_wr = NULL;
 		CTR2(KTR_CXGBE, "%s: tid %d sent key WR", __func__, toep->tid);
 	}
+#endif
 }
 
 static u_int
