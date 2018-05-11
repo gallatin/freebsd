@@ -2087,6 +2087,11 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 
 	tls_ofld->mac_length = k_ctx->mac_secret_size;
 
+	/*
+	 * XXX: This should move into sbtls_init_sb_tls().  It has to
+	 * always be the same values regardless of the cipher backend,
+	 * so doing it in the backends just duplicates a lot of code.
+	 */
 	if (en->crypt_algorithm == CRYPTO_AES_NIST_GCM_16) {
 		tls->sb_params.sb_tls_hlen = TLS_HEADER_LENGTH +
 		    AEAD_EXPLICIT_DATA_SIZE;
