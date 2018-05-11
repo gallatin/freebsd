@@ -2102,6 +2102,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		    CIPHER_BLOCK_SIZE;
 		/* XXX: Padding */
 		tls->sb_params.sb_tls_tlen = tls_ofld->mac_length;
+		tls->sb_params.sb_tls_bs = /* XXX */;
 #endif
 	}
 	tls->t_type = SBTLS_T_TYPE_CHELSIO;

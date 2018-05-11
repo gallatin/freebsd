@@ -624,6 +624,10 @@ sbtls_frame(struct mbuf **top, struct socket *so, int *enq_cnt,
 		pgs->hdr_len = tls->sb_params.sb_tls_hlen;
 		pgs->trail_len = tls->sb_params.sb_tls_tlen;
 
+		/*
+		 * XXX: This should not be conditional on type but
+		 * conditional on algorithm (== CBC or the like).
+		 */
 		if (tls->t_type == SBTLS_T_TYPE_BSSL) {
 			int bs, delta;
 
