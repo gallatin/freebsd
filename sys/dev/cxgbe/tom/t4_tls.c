@@ -2739,8 +2739,8 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	tx_data = txq_advance(txq, dst, key_size(toep));
 	OPCODE_TID(tx_data) = htonl(MK_OPCODE_TID(CPL_TX_DATA, toep->tid));
 	mss = toep->vi->ifp->if_mtu - (m->m_pkthdr.l3hlen + m->m_pkthdr.l4hlen);
-	tx_data->len = V_TX_DATA_MSS(mss) |
-	    V_TX_LENGTH(plen + ext_pgs->trail_len);
+	tx_data->len = htobe32(V_TX_DATA_MSS(mss) |
+	    V_TX_LENGTH(plen + ext_pgs->trail_len));
 	tx_data->rsvd = htobe32(tcp_seqno);
 	tx_data->flags = htobe32(F_TX_BYPASS);
 
