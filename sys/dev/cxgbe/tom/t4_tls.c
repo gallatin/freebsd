@@ -2393,8 +2393,29 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 #else
 	{
 #endif
+		/*
+		 * XXX: We can't modify the TLS header in ext_pgs as then
+		 * the header length would be wrong for a retransmit.
+		 * Instead, use the empty space in the header mbuf after
+		 * the TCP header as a scratch area to write the
+		 * TLS header.  This is a gross hack, but if we are able
+		 * to write the TLS header as an immediate in the WR
+		 * in the future we can remove it.  This trick will only
+		 * work safely if we are always going to generate the
+		 * same TLS header contents which is true for GCM at
+		 * least.
+		 */
+		if (M_TRAILINGSPACE(m) < ext_pgs->hdr_len) {
+			CTR3(KTR_CXGBE,
+			    "%s: tid %d no room for TLS header (%u)",
+			    __func__, cipher->toep->tid, M_TRAILINGSPACE(m));
+			return (EINVAL);
+		}
+		*nsegsp = 1;
+
 		/* XXX: eventually make tls_hdr always immediate? */
-		*nsegsp = sglist_count_ext_pgs(ext_pgs, 0, plen);
+		*nsegsp += sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len,
+		    plen - ext_pgs->hdr_len);
 
 		wr_len += sbtls_sgl_size(*nsegsp);
 	}
@@ -2545,7 +2566,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	struct cpl_tx_sec_pdu *sec_pdu;
 	struct cpl_tx_data *tx_data;
 	struct mbuf_ext_pgs *ext_pgs;
-	struct tls_record_layer *hdr;
+	struct tls_record_layer *hdr, *inhdr;
 	struct tcphdr *tcp;
 	struct mbuf *m_tls;
 	u_int aad_start, aad_stop;
@@ -2570,8 +2591,12 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	/* Flesh out TLS header */
 	MBUF_EXT_PGS_ASSERT(m_tls);
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
-	hdr = (void *)ext_pgs->hdr;
-	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
+	inhdr = (void *)ext_pgs->hdr;
+	hdr = mtodo(m, m->m_len);
+	plen = ext_pgs->hdr_len + ntohs(inhdr->tls_length);
+	hdr->tls_type = inhdr->tls_type;
+	hdr->tls_vmajor = inhdr->tls_vmajor;
+	hdr->tls_vminor = inhdr->tls_vminor;
 	hdr->tls_length = htons(plen + ext_pgs->trail_len - TLS_HEADER_LENGTH);
 	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
 
@@ -2602,7 +2627,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	{
 		int i, off, pgoff;
 
-		memcpy(tls_record, ext_pgs->hdr, ext_pgs->hdr_len);
+		memcpy(tls_record, hdr, ext_pgs->hdr_len);
 		off = ext_pgs->hdr_len;
 		pgoff = ext_pgs->first_pg_off;
 		for (i = 0; i < ext_pgs->npgs; i++)
@@ -2731,7 +2756,9 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 		panic("TODO: copy immediate data");
 	} else {
 		sglist_reset(txq->gl);
-		if (sglist_append_ext_pgs(txq->gl, ext_pgs, 0, plen) != 0) {
+		if (sglist_append(txq->gl, hdr, ext_pgs->hdr_len) != 0 ||
+		    sglist_append_ext_pgs(txq->gl, ext_pgs, ext_pgs->hdr_len,
+		    plen - ext_pgs->hdr_len) != 0) {
 #ifdef INVARIANTS
 			panic("%s: failed to append sglist", __func__);
 #endif
