@@ -2669,7 +2669,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	sec_pdu = txq_advance(txq, idata, sizeof(*idata));
 	sec_pdu->op_ivinsrtofst = htobe32(
 	    V_CPL_TX_SEC_PDU_OPCODE(CPL_TX_SEC_PDU) |
-	    V_CPL_TX_SEC_PDU_CPLLEN(2) | V_CPL_TX_SEC_PDU_PLACEHOLDER(1) |
+	    V_CPL_TX_SEC_PDU_CPLLEN(2) | V_CPL_TX_SEC_PDU_PLACEHOLDER(0) |
 	    V_CPL_TX_SEC_PDU_IVINSRTOFST(TLS_HEADER_LENGTH + 1));
 
 	sec_pdu->pldlen = htobe32(plen);
@@ -2686,14 +2686,14 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	if (toep->tls.k_ctx.state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
 		cipher_stop = 0;
 		auth_start = cipher_start;
-		auth_stop = GCM_TAG_SIZE;
-		auth_insert = GCM_TAG_SIZE;
+		auth_stop = 0;
+		auth_insert = 0;
 	} else {
 		/* XXX: This might not be quite right due to padding. */
-		cipher_stop = ext_pgs->trail_len;
+		cipher_stop = 0;
 		auth_start = cipher_start;
 		auth_stop = cipher_stop;
-		auth_insert = ext_pgs->trail_len;
+		auth_insert = 0;
 	}
 	sec_pdu->aadstart_cipherstop_hi = htobe32(
 	    V_CPL_TX_SEC_PDU_AADSTART(aad_start) |
