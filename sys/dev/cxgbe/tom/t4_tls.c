@@ -2087,24 +2087,6 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 
 	tls_ofld->mac_length = k_ctx->mac_secret_size;
 
-#ifdef notyet
-	/* XXX: Will we need this stuff? */
-	{
-		unsigned short pdus_per_ulp;
-
-		if (tls_ofld->key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
-			tls_ofld->tx_key_addr = 1;
-
-		tls_ofld->fcplenmax = get_tp_plen_max(tls_ofld);
-		tls_ofld->expn_per_ulp = tls_expansion_size(toep,
-				tls_ofld->fcplenmax, 1, &pdus_per_ulp);
-		tls_ofld->pdus_per_ulp = pdus_per_ulp;
-		tls_ofld->adjusted_plen = tls_ofld->pdus_per_ulp *
-			((tls_ofld->expn_per_ulp/tls_ofld->pdus_per_ulp) +
-			 tls_ofld->k_ctx.frag_size);
-	}
-#endif
-
 	if (en->crypt_algorithm == CRYPTO_AES_NIST_GCM_16) {
 		tls->sb_params.sb_tls_hlen = TLS_HEADER_LENGTH +
 		    AEAD_EXPLICIT_DATA_SIZE;
