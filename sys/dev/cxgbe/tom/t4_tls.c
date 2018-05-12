@@ -2629,7 +2629,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 
 			pglen = mbuf_ext_pg_len(ext_pgs, i, pgoff);
 			tocopy = pglen;
-			if (tocopy < sizeof(tls_record) - off)
+			if (tocopy > sizeof(tls_record) - off)
 				tocopy = sizeof(tls_record) - off;
 			memcpy(tls_record + off,
 			    (void *)(uintptr_t)(PHYS_TO_DMAP(ext_pgs->pa[i]) + pgoff),
