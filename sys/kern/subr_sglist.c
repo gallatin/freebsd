@@ -393,6 +393,7 @@ sglist_append_ext_pgs(struct sglist *sg, struct mbuf_ext_pgs *ext_pgs,
 	vm_paddr_t paddr;
 	int error, i, pglen, pgoff;
 
+	error = 0;
 	if (ext_pgs->hdr_len != 0) {
 		if (off >= ext_pgs->hdr_len) {
 			off -= ext_pgs->hdr_len;
@@ -423,13 +424,14 @@ sglist_append_ext_pgs(struct sglist *sg, struct mbuf_ext_pgs *ext_pgs,
 		error = sglist_append_phys(sg, paddr, seglen);
 		pgoff = 0;
 	};
-	if (len) {
+	if (error == 0 && len > 0) {
 		seglen = MIN(len, ext_pgs->trail_len - off);
 		len -= seglen;
 		error = sglist_append(sg,
 		    &ext_pgs->trail[off], seglen);
 	}
-	KASSERT(len == 0, ("len != 0"));
+	if (error == 0)
+		KASSERT(len == 0, ("len != 0"));
 	return (error);
 }
 
