@@ -2514,6 +2514,8 @@ write_gl_to_txd(struct sge_txq *txq, caddr_t to)
 
 _Static_assert(sizeof(struct cpl_set_tcb_field) <= EQ_ESIZE,
     "CPL_SET_TCB_FIELD must be smaller than a single TX descriptor");
+_Static_assert(W_TCB_SND_UNA_RAW == W_TCB_SND_NXT_RAW,
+    "SND_NXT_RAW and SND_UNA_RAW are in different words");
 
 static int
 sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
@@ -2562,18 +2564,15 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
-	write_set_tcb_field(toep, dst, W_TCB_SND_NXT_RAW,
-	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW), V_TCB_SND_NXT_RAW(0));
+	write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
+	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW) |
+	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW),
+	    V_TCB_SND_NXT_RAW(0) | V_TCB_SND_UNA_RAW(0));
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
 	write_set_tcb_field(toep, dst, W_TCB_SND_MAX_RAW,
 	    V_TCB_SND_MAX_RAW(M_TCB_SND_MAX_RAW), V_TCB_SND_MAX_RAW(0));
-	dst = txq_advance(txq, dst, EQ_ESIZE);
-	ndesc++;
-	txq->raw_wrs++;
-	write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
-	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW), V_TCB_SND_UNA_RAW(0));
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
