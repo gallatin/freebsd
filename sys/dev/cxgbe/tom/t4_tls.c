@@ -1755,6 +1755,7 @@ send_sbtls_act_open_req(struct adapter *sc, struct vi_info *vi,
 	inp_4tuple_get(inp, &cpl->local_ip, &cpl->local_port,
 	    &cpl->peer_ip, &cpl->peer_port);
 
+	CTR2(KTR_CXGBE, "%s: MTU index %d", __func__, mtu_idx);
 	options = F_TCAM_BYPASS | V_MSS_IDX(mtu_idx) |
 	    V_ULP_MODE(ULP_MODE_NONE);
 	options |= V_L2T_IDX(toep->l2te->idx);
