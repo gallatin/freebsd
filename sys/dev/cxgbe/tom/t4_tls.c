@@ -2584,32 +2584,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	txq->raw_wrs++;
 
 	/* XXX: rcv_wnd? */
-#if 1
-	{
-		int i, off, pgoff;
 
-		memcpy(tls_record, hdr, ext_pgs->hdr_len);
-		off = ext_pgs->hdr_len;
-		pgoff = ext_pgs->first_pg_off;
-		for (i = 0; i < ext_pgs->npgs; i++)
-		{
-			int pglen, tocopy;
-
-			pglen = mbuf_ext_pg_len(ext_pgs, i, pgoff);
-			tocopy = pglen;
-			if (tocopy > sizeof(tls_record) - off)
-				tocopy = sizeof(tls_record) - off;
-			memcpy(tls_record + off,
-			    (void *)(uintptr_t)(PHYS_TO_DMAP(ext_pgs->pa[i]) + pgoff),
-			    tocopy);
-			pgoff = 0;
-			off += tocopy;
-			if (off == sizeof(tls_record))
-				break;
-		}
-		tls_record_len = off;
-	}
-#endif
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
 
@@ -2721,6 +2696,33 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 #endif
 	}
 	write_gl_to_txd(txq, dst);
+
+#if 1
+	{
+		int i, off, pgoff;
+
+		memcpy(tls_record, hdr, ext_pgs->hdr_len);
+		off = ext_pgs->hdr_len;
+		pgoff = ext_pgs->first_pg_off;
+		for (i = 0; i < ext_pgs->npgs; i++)
+		{
+			int pglen, tocopy;
+
+			pglen = mbuf_ext_pg_len(ext_pgs, i, pgoff);
+			tocopy = pglen;
+			if (tocopy > sizeof(tls_record) - off)
+				tocopy = sizeof(tls_record) - off;
+			memcpy(tls_record + off,
+			    (void *)(uintptr_t)(PHYS_TO_DMAP(ext_pgs->pa[i]) + pgoff),
+			    tocopy);
+			pgoff = 0;
+			off += tocopy;
+			if (off == sizeof(tls_record))
+				break;
+		}
+		tls_record_len = off;
+	}
+#endif
 
 	ndesc += howmany(wr_len, EQ_ESIZE);
 	MPASS(ndesc <= available);
