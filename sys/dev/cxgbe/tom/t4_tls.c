@@ -2369,45 +2369,18 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	MBUF_EXT_PGS_ASSERT(m_tls);
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	hdr = (void *)ext_pgs->hdr;
-	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
+	plen = ntohs(hdr->tls_length);
 
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
-	/* XXX: immediate data eventually */
-#ifdef notyet
-	if (plen <= SGE_MAX_WR_LEN - wr_len) {
-		*nsegsp = 0;
-		wr_len += plen;
-	} else {
-#else
-	{
-#endif
-		/*
-		 * XXX: We can't modify the TLS header in ext_pgs as then
-		 * the header length would be wrong for a retransmit.
-		 * Instead, use the empty space in the header mbuf after
-		 * the TCP header as a scratch area to write the
-		 * TLS header.  This is a gross hack, but if we are able
-		 * to write the TLS header as an immediate in the WR
-		 * in the future we can remove it.  This trick will only
-		 * work safely if we are always going to generate the
-		 * same TLS header contents which is true for GCM at
-		 * least.
-		 */
-		if (M_TRAILINGSPACE(m) < ext_pgs->hdr_len) {
-			CTR3(KTR_CXGBE,
-			    "%s: tid %d no room for TLS header (%u)",
-			    __func__, cipher->toep->tid, M_TRAILINGSPACE(m));
-			return (EINVAL);
-		}
-		*nsegsp = 1;
 
-		/* XXX: eventually make tls_hdr always immediate? */
-		*nsegsp += sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len,
-		    plen - ext_pgs->hdr_len);
+	/* TLS header as immediate data, padded to 16 bytes. */
+	wr_len += roundup2(ext_pgs->hdr_len, 16);
 
-		wr_len += sbtls_sgl_size(*nsegsp);
-	}
+	/* TLS record payload via DSGL. */
+	*nsegsp = sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len, plen);
+	wr_len += sbtls_sgl_size(*nsegsp);
+
 	wr_len = roundup2(wr_len, 16);
 	CTR4(KTR_CXGBE, "%s: tid %d wr_len %d nsegs %d", __func__,
 	    cipher->toep->tid, wr_len, *nsegsp);
@@ -2577,17 +2550,11 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	    m->m_pkthdr.l3hlen);
 	tcp_seqno = ntohl(tcp->th_seq) - mtod(m_tls, vm_offset_t);
 
-	/* Flesh out TLS header */
+	/* Locate the template TLS header. */
 	MBUF_EXT_PGS_ASSERT(m_tls);
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	inhdr = (void *)ext_pgs->hdr;
-	hdr = mtodo(m, m->m_len);
 	plen = ext_pgs->hdr_len + ntohs(inhdr->tls_length);
-	hdr->tls_type = inhdr->tls_type;
-	hdr->tls_vmajor = inhdr->tls_vmajor;
-	hdr->tls_vminor = inhdr->tls_vminor;
-	hdr->tls_length = htons(plen + ext_pgs->trail_len - TLS_HEADER_LENGTH);
-	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
 
 	/* Update TCB fields. */
 	write_set_tcb_field(toep, dst, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX),
@@ -2645,19 +2612,10 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 #endif
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
-	/* XXX: immediate data eventually */
-#ifdef notyet
-	if (nsegs == 0) {
-		MPASS(plen <= SGE_MAX_WR_LEN - wr_len);
-		wr_len += plen;
-		imm_len = plen;
-	} else {
-#else
-	{
-#endif
-		wr_len += sbtls_sgl_size(nsegs);
-		imm_len = 0;
-	}
+
+	imm_len = ext_pgs->hdr_len;
+	wr_len += roundup2(imm_len, 16);
+	wr_len += sbtls_sgl_size(nsegs);
 	wr_len = roundup2(wr_len, 16);
 	MPASS(ndesc + howmany(wr_len, EQ_ESIZE) <= available);
 
@@ -2679,7 +2637,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	/* ULPTX_IDATA sub-command */
 	idata = txq_advance(txq, txpkt, sizeof(*txpkt));
 	idata->cmd_more = htobe32(V_ULPTX_CMD(ULP_TX_SC_IMM) |
-	    V_ULP_TX_SC_MORE(imm_len != 0 ? 0 : 1));
+	    V_ULP_TX_SC_MORE(1));
 	idata->len = htobe32(sizeof(struct cpl_tx_sec_pdu) + key_size(toep) +
 	    sizeof(struct cpl_tx_data) + imm_len);
 
@@ -2745,20 +2703,24 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	tx_data->rsvd = htobe32(tcp_seqno);
 	tx_data->flags = htobe32(F_TX_BYPASS);
 
-	dst = txq_advance(txq, tx_data, sizeof(*tx_data));
-	if (imm_len != 0) {
-		panic("TODO: copy immediate data");
-	} else {
-		sglist_reset(txq->gl);
-		if (sglist_append(txq->gl, hdr, ext_pgs->hdr_len) != 0 ||
-		    sglist_append_ext_pgs(txq->gl, ext_pgs, ext_pgs->hdr_len,
-		    plen - ext_pgs->hdr_len) != 0) {
+	/* Populate the TLS header */
+	hdr = txq_advance(txq, tx_data, sizeof(*tx_data));
+	hdr->tls_type = inhdr->tls_type;
+	hdr->tls_vmajor = inhdr->tls_vmajor;
+	hdr->tls_vminor = inhdr->tls_vminor;
+	hdr->tls_length = htons(plen + ext_pgs->trail_len - TLS_HEADER_LENGTH);
+	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
+
+	/* SGL for record payload */
+	dst = txq_advance(txq, hdr, roundup2(imm_len, 16));
+	sglist_reset(txq->gl);
+	if (sglist_append_ext_pgs(txq->gl, ext_pgs, ext_pgs->hdr_len,
+	    plen - ext_pgs->hdr_len) != 0) {
 #ifdef INVARIANTS
-			panic("%s: failed to append sglist", __func__);
+		panic("%s: failed to append sglist", __func__);
 #endif
-		}
-		write_gl_to_txd(txq, dst);
 	}
+	write_gl_to_txd(txq, dst);
 
 	ndesc += howmany(wr_len, EQ_ESIZE);
 	MPASS(ndesc <= available);
