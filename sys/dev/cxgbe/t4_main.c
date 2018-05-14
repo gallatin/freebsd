@@ -5457,6 +5457,25 @@ t4_sysctls(struct adapter *sc)
 	}
 #endif
 
+#ifdef KERN_TLS
+	if (sc->flags & KERN_TLS_OK) {
+
+		/*
+		 * dev.t4nex.0.tls.
+		 */
+		oid = SYSCTL_ADD_NODE(ctx, c0, OID_AUTO, "tls", CTLFLAG_RD,
+		    NULL, "KERN_TLS parameters");
+		children = SYSCTL_CHILDREN(oid);
+
+		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "enable", CTLFLAG_RW,
+		    &sc->tlst.enable, 0, "Enable TLS offload");
+		SYSCTL_ADD_INT(ctx, children, OID_AUTO, "inline_keys",
+		    CTLFLAG_RW, &sc->tlst.inline_keys, 0, "Always pass TLS "
+		    "keys in work requests (1) or attempt to store TLS keys "
+		    "in card memory.");
+	}
+#endif
+
 #ifdef TCP_OFFLOAD
 	if (is_offload(sc)) {
 		int i;
