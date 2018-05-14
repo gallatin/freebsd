@@ -2616,7 +2616,6 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	    sizeof(struct cpl_tx_data) + imm_len);
 
 	/* CPL_TX_SEC_PDU */
-	/* XXX: Not sure about TX_SEC_PDU_PLACEHOLDER */
 	sec_pdu = txq_advance(txq, idata, sizeof(*idata));
 	sec_pdu->op_ivinsrtofst = htobe32(
 	    V_CPL_TX_SEC_PDU_OPCODE(CPL_TX_SEC_PDU) |
