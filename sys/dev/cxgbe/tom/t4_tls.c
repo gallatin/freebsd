@@ -2564,6 +2564,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
+
 	write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
 	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW) |
 	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW),
@@ -2571,18 +2572,24 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
+
 	write_set_tcb_field(toep, dst, W_TCB_SND_MAX_RAW,
 	    V_TCB_SND_MAX_RAW(M_TCB_SND_MAX_RAW), V_TCB_SND_MAX_RAW(0));
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
+
 	write_set_tcb_field(toep, dst, W_TCB_RCV_NXT,
 	    V_TCB_RCV_NXT(M_TCB_RCV_NXT), V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
 	dst = txq_advance(txq, dst, EQ_ESIZE);
 	ndesc++;
 	txq->raw_wrs++;
 
-	/* XXX: rcv_wnd? */
+	write_set_tcb_field(toep, dst, W_TCB_RCV_WND,
+	    V_TCB_RCV_WND(M_TCB_RCV_WND), V_TCB_RCV_WND(ntohs(tcp->th_win)));
+	dst = txq_advance(txq, dst, EQ_ESIZE);
+	ndesc++;
+	txq->raw_wrs++;
 
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
