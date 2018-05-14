@@ -885,6 +885,9 @@ struct t6_sbtls_cipher {
 	struct toepcb *toep;
 	struct sge_txq *txq;
 	struct mbuf *key_wr;
+	uint32_t prev_seq;
+	uint32_t prev_ack;
+	uint16_t prev_win;
 };
 
 #define ADAPTER_LOCK(sc)		mtx_lock(&(sc)->sc_lock)

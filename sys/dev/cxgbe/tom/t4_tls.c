@@ -2522,10 +2522,14 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	u_int auth_start, auth_stop, auth_insert;
 	u_int cipher_start, cipher_stop;
 	u_int imm_len, mss, ndesc, plen, tcp_seqno, wr_len;
+	bool first_wr;
 
 	ndesc = 0;
 	toep = cipher->toep;
 	MPASS(cipher->txq == txq);
+
+	first_wr = (cipher->prev_seq == 0 && cipher->prev_ack == 0 &&
+	    cipher->prev_win == 0);
 
 	/* Find the TLS record. */
 	for (m_tls = m;; m_tls = m_tls->m_next)
@@ -2544,11 +2548,23 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	plen = ext_pgs->hdr_len + ntohs(inhdr->tls_length);
 
 	/* Update TCB fields. */
-	write_set_tcb_field(toep, dst, W_TCB_TX_MAX, V_TCB_TX_MAX(M_TCB_TX_MAX),
-	    V_TCB_TX_MAX(tcp_seqno));
-	dst = txq_advance(txq, dst, EQ_ESIZE);
-	ndesc++;
-	txq->raw_wrs++;
+	if (first_wr || cipher->prev_seq != tcp_seqno) {
+		if (!first_wr)
+			printf("%s: prev_seq %u current seq %u\n", __func__,
+			    cipher->prev_seq, tcp_seqno);
+		write_set_tcb_field(toep, dst, W_TCB_TX_MAX,
+		    V_TCB_TX_MAX(M_TCB_TX_MAX), V_TCB_TX_MAX(tcp_seqno));
+		dst = txq_advance(txq, dst, EQ_ESIZE);
+		ndesc++;
+		txq->raw_wrs++;
+	} else
+		printf("%s: skipped TX_MAX\n", __func__);
+
+	/*
+	 * Store the expected sequence number of the next byte after
+	 * this record.
+	 */
+	cipher->prev_seq = tcp_seqno + plen + ext_pgs->trail_len;
 
 	write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
 	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW) |
@@ -2564,17 +2580,27 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	ndesc++;
 	txq->raw_wrs++;
 
-	write_set_tcb_field(toep, dst, W_TCB_RCV_NXT,
-	    V_TCB_RCV_NXT(M_TCB_RCV_NXT), V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
-	dst = txq_advance(txq, dst, EQ_ESIZE);
-	ndesc++;
-	txq->raw_wrs++;
+	if (first_wr || cipher->prev_ack != ntohl(tcp->th_ack)) {
+		write_set_tcb_field(toep, dst, W_TCB_RCV_NXT,
+		    V_TCB_RCV_NXT(M_TCB_RCV_NXT),
+		    V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
+		dst = txq_advance(txq, dst, EQ_ESIZE);
+		ndesc++;
+		txq->raw_wrs++;
+		cipher->prev_ack = ntohl(tcp->th_ack);
+	} else
+		printf("%s: skipped RCV_NXT\n", __func__);
 
-	write_set_tcb_field(toep, dst, W_TCB_RCV_WND,
-	    V_TCB_RCV_WND(M_TCB_RCV_WND), V_TCB_RCV_WND(ntohs(tcp->th_win)));
-	dst = txq_advance(txq, dst, EQ_ESIZE);
-	ndesc++;
-	txq->raw_wrs++;
+	if (first_wr || cipher->prev_win != ntohs(tcp->th_win)) {
+		write_set_tcb_field(toep, dst, W_TCB_RCV_WND,
+		    V_TCB_RCV_WND(M_TCB_RCV_WND),
+		    V_TCB_RCV_WND(ntohs(tcp->th_win)));
+		dst = txq_advance(txq, dst, EQ_ESIZE);
+		ndesc++;
+		txq->raw_wrs++;
+		cipher->prev_win = ntohs(tcp->th_win);
+	} else
+		printf("%s: skipped RCV_WND\n", __func__);
 
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
