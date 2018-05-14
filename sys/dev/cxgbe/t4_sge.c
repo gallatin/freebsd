@@ -2242,9 +2242,13 @@ count_mbuf_nsegs(struct mbuf *m, uint8_t *cflags,
 		if ((m->m_flags & M_NOMAP) != 0) {
 			*cflags |= MC_NOMAP;
 			if (is_tls_mbuf(m)) {
-				MPASS(*cipherp == NULL);
-				*cflags |= MC_TLS;
-				*cipherp = tls_mbuf_cipher(m);
+				if (*cflags & MC_TLS) {
+					MPASS(*cipherp == tls_mbuf_cipher(m));
+				} else {
+					MPASS(*cipherp == NULL);
+					*cflags |= MC_TLS;
+					*cipherp = tls_mbuf_cipher(m);
+				}
 			}
 			nsegs += count_mbuf_ext_pgs(m, &lastb);
 			continue;
@@ -2640,7 +2644,9 @@ eth_tx(struct mp_ring *r, u_int cidx, u_int pidx)
 			ETHER_BPF_MTAP(ifp, m0);
 			n = write_txpkt_wr(txq, (void *)wr, m0, available);
 		}
-		MPASS(n >= 1 && n <= available && n <= SGE_MAX_WR_NDESC);
+		MPASS(n >= 1 && n <= available);
+		if (!(mbuf_cflags(m0) & MC_TLS))		
+			MPASS(n <= SGE_MAX_WR_NDESC);
 
 		available -= n;
 		dbdiff += n;

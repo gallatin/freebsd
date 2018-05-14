@@ -2289,16 +2289,45 @@ sbtls_sgl_size(u_int nsegs)
 }
 
 static int
-sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
-    int *len16p)
+sbtls_wr_len(struct t6_sbtls_cipher *cipher, struct mbuf *m_tls, int *nsegsp)
 {
 	struct mbuf_ext_pgs *ext_pgs;
 	struct tls_record_layer *hdr;
+	u_int plen, wr_len;
+
+	/*
+	 * Determine the size of the entire TLS record payload
+	 * excluding the trailer.
+	 */
+	MBUF_EXT_PGS_ASSERT(m_tls);
+	ext_pgs = (void *)m_tls->m_ext.ext_buf;
+	hdr = (void *)ext_pgs->hdr;
+	plen = ntohs(hdr->tls_length);
+
+	/* Calculate the size of the work request. */
+	wr_len = sbtls_base_wr_size(cipher->toep);
+
+	/* TLS header as immediate data, padded to 16 bytes. */
+	wr_len += roundup2(ext_pgs->hdr_len, 16);
+
+	/* TLS record payload via DSGL. */
+	*nsegsp = sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len, plen);
+	wr_len += sbtls_sgl_size(*nsegsp);
+
+	wr_len = roundup2(wr_len, 16);
+	return (wr_len);
+}
+
+static int
+sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
+    int *len16p)
+{
 	struct ether_header *eh;
 	struct ip *ip;
 	struct tcphdr *tcp;
 	struct mbuf *m_tls;
-	u_int plen, wr_len;
+	int nsegs;
+	u_int wr_len, tot_len;
 
 	/*
 	 * Locate headers in initial mbuf.
@@ -2339,45 +2368,47 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 
 	/* XXX: Reject unsupported TCP options? */
 
-	/* Find the TLS record. */
-	for (m_tls = m;; m_tls = m_tls->m_next)
-		if (m_tls->m_flags & M_NOMAP)
-			break;
-
 	/* Assume all headers are in 'm' for now. */
-	MPASS(m->m_next == m_tls);
+	MPASS(m->m_next != NULL);
+	MPASS(m->m_next->m_flags & M_NOMAP);
 
 	/*
-	 * Determine the size of the entire TLS record payload
-	 * excluding the trailer.
+	 * Each of the remaining mbufs in the chain should reference a
+	 * TLS record.
 	 */
-	MBUF_EXT_PGS_ASSERT(m_tls);
-	ext_pgs = (void *)m_tls->m_ext.ext_buf;
-	hdr = (void *)ext_pgs->hdr;
-	plen = ntohs(hdr->tls_length);
+	tot_len = 0;
+	*nsegsp = 0;
+	for (m_tls = m->m_next; m_tls != NULL; m_tls = m_tls->m_next) {
+		MPASS(m_tls->m_flags & M_NOMAP);
 
-	/* Calculate the size of the work request. */
-	wr_len = sbtls_base_wr_size(cipher->toep);
+		wr_len = sbtls_wr_len(cipher, m_tls, &nsegs);
+		CTR4(KTR_CXGBE, "%s: tid %d wr_len %d nsegs %d", __func__,
+		    cipher->toep->tid, wr_len, nsegs);
+		if (wr_len > SGE_MAX_WR_LEN || nsegs > TX_SGL_SEGS)
+			return (EFBIG);
 
-	/* TLS header as immediate data, padded to 16 bytes. */
-	wr_len += roundup2(ext_pgs->hdr_len, 16);
+		/*
+		 * Store 'nsegs' for the first TLS record in the
+		 * header mbuf's metadata.
+		 */
+		if (*nsegsp == 0) {
+			CTR3(KTR_CXGBE, "%s: tid %d nsegs %d", __func__,
+			    cipher->toep->tid, nsegs);
+			*nsegsp = nsegs;
+		}
 
-	/* TLS record payload via DSGL. */
-	*nsegsp = sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len, plen);
-	wr_len += sbtls_sgl_size(*nsegsp);
+		/*
+		 * Include room for up to 5 SET_TCB requests before
+		 * the real work request.
+		 *
+		 * XXX: If there is more than one record, the extra
+		 * records should only use 2 each.
+		 */
+		tot_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field), 16) +
+		    wr_len;
+	}
 
-	wr_len = roundup2(wr_len, 16);
-	CTR4(KTR_CXGBE, "%s: tid %d wr_len %d nsegs %d", __func__,
-	    cipher->toep->tid, wr_len, *nsegsp);
-	if (wr_len > SGE_MAX_WR_LEN || *nsegsp > TX_SGL_SEGS)
-		return (EFBIG);
-
-	/*
-	 * Include room for up to 5 SET_TCB requests before the real
-	 * work request.
-	 */
-	wr_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
-	*len16p = wr_len / 16;
+	*len16p = tot_len / 16;
 	CTR3(KTR_CXGBE, "%s: tid %d len16 %d", __func__,
 	    cipher->toep->tid, *len16p);
 	return (0);
@@ -2503,11 +2534,10 @@ _Static_assert(W_TCB_SND_UNA_RAW == W_TCB_SND_NXT_RAW,
     "SND_NXT_RAW and SND_UNA_RAW are in different words");
 
 static int
-sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
-    struct mbuf *m, u_int nsegs, u_int available)
+sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
+    void *dst, struct mbuf *m, struct tcphdr *tcp, struct mbuf *m_tls,
+    u_int nsegs, u_int available, tcp_seq tcp_seqno)
 {
-	struct sge_eq *eq = &txq->eq;
-	struct tx_sdesc *txsd;
 	struct toepcb *toep;
 	struct fw_ulptx_wr *wr;
 	struct ulp_txpkt *txpkt;
@@ -2516,12 +2546,10 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	struct cpl_tx_data *tx_data;
 	struct mbuf_ext_pgs *ext_pgs;
 	struct tls_record_layer *hdr, *inhdr;
-	struct tcphdr *tcp;
-	struct mbuf *m_tls;
 	u_int aad_start, aad_stop;
 	u_int auth_start, auth_stop, auth_insert;
 	u_int cipher_start, cipher_stop;
-	u_int imm_len, mss, ndesc, plen, tcp_seqno, wr_len;
+	u_int imm_len, mss, ndesc, plen, wr_len;
 	bool first_wr;
 
 	ndesc = 0;
@@ -2530,16 +2558,6 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 
 	first_wr = (cipher->prev_seq == 0 && cipher->prev_ack == 0 &&
 	    cipher->prev_win == 0);
-
-	/* Find the TLS record. */
-	for (m_tls = m;; m_tls = m_tls->m_next)
-		if (m_tls->m_flags & M_NOMAP)
-			break;
-
-	/* Determine the TCP sequence number of the start of the record. */
-	tcp = (struct tcphdr *)(mtod(m, char *) + m->m_pkthdr.l2hlen +
-	    m->m_pkthdr.l3hlen);
-	tcp_seqno = ntohl(tcp->th_seq) - mtod(m_tls, vm_offset_t);
 
 	/* Locate the template TLS header. */
 	MBUF_EXT_PGS_ASSERT(m_tls);
@@ -2601,6 +2619,11 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 		cipher->prev_win = ntohs(tcp->th_win);
 	} else
 		printf("%s: skipped RCV_WND\n", __func__);
+
+	/* Recalculate 'nsegs' if cached value is not available. */
+	if (nsegs == 0)
+		nsegs = sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len,
+		    plen - ext_pgs->hdr_len);
 
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
@@ -2744,11 +2767,62 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	MPASS(ndesc <= available);
 	txq->tls_wrs++;
 
+	return (ndesc);
+}
+
+static int
+sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
+    struct mbuf *m, u_int nsegs, u_int available)
+{
+	struct sge_eq *eq = &txq->eq;
+	struct tx_sdesc *txsd;
+	struct tcphdr *tcp;
+	struct mbuf *m_tls;
+	tcp_seq tcp_seqno;
+	u_int ndesc, totdesc;
+
+	totdesc = 0;
+	tcp = (struct tcphdr *)(mtod(m, char *) + m->m_pkthdr.l2hlen +
+	    m->m_pkthdr.l3hlen);
+
+	/*
+	 * Iterate over each TLS record constructing a work request
+	 * for that record.
+	 */
+	for (m_tls = m->m_next; m_tls != NULL; m_tls = m_tls->m_next) {
+		MPASS(m_tls->m_flags & M_NOMAP);
+
+		/*
+		 * Determine the initial TCP sequence number for this
+		 * record.
+		 */
+		if (m_tls == m->m_next) {
+			tcp_seqno = ntohl(tcp->th_seq) -
+			    mtod(m_tls, vm_offset_t);
+		} else {
+			MPASS(mtod(m_tls, vm_offset_t) == 0);
+			tcp_seqno = cipher->prev_seq;
+		}
+
+		ndesc = sbtls_write_tls_wr(cipher, txq, dst, m, tcp, m_tls,
+		    nsegs, available - totdesc, tcp_seqno);
+		totdesc += ndesc;
+		dst = txq_advance(txq, dst, ndesc * EQ_ESIZE);
+
+		/*
+		 * The value of nsegs from the header mbuf's metadata
+		 * is only valid for the first TLS record.
+		 */
+		nsegs = 0;
+	}
+	
+	MPASS(totdesc <= available);
+
 	txsd = &txq->sdesc[eq->pidx];
 	txsd->m = m;
-	txsd->desc_used = ndesc;
+	txsd->desc_used = totdesc;
 
-	return (ndesc);
+	return (totdesc);
 }
 
 static void
