@@ -2024,6 +2024,19 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	    V_TCB_T_FLAGS(V_TF_CORE_BYPASS(1)));
 	if (error)
 		goto failed;
+
+	/* Clear the SND_UNA_RAW, SND_NXT_RAW, and SND_MAX_RAW offsets. */
+	error = sbtls_set_tcb_field(toep, txq, W_TCB_SND_UNA_RAW,
+	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW) |
+	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW),
+	    V_TCB_SND_NXT_RAW(0) | V_TCB_SND_UNA_RAW(0));
+	if (error)
+		goto failed;
+	error = sbtls_set_tcb_field(toep, txq, W_TCB_SND_MAX_RAW,
+	    V_TCB_SND_MAX_RAW(M_TCB_SND_MAX_RAW), V_TCB_SND_MAX_RAW(0));
+	if (error)
+		goto failed;
+
 #ifdef notsure
 	error = sbtls_set_tcb_field(toep, txq, W_TCB_TX_MAX,
 	    V_TCB_TX_MAX(M_TCB_TX_MAX), 0);
@@ -2396,18 +2409,15 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 			    cipher->toep->tid, nsegs);
 			*nsegsp = nsegs;
 		}
-
-		/*
-		 * Include room for up to 5 SET_TCB requests before
-		 * the real work request.
-		 *
-		 * XXX: If there is more than one record, the extra
-		 * records should only use 2 each.
-		 */
-		tot_len += 5 * roundup2(sizeof(struct cpl_set_tcb_field), 16) +
-		    wr_len;
+		tot_len += wr_len;
 	}
 
+	/*
+	 * Include room for up to 3 CPL_SET_TCB_FIELD requests before
+	 * the first TLS work request.
+	 */
+	tot_len += 3 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
+	
 	*len16p = tot_len / 16;
 	CTR3(KTR_CXGBE, "%s: tid %d len16 %d", __func__,
 	    cipher->toep->tid, *len16p);
@@ -2583,20 +2593,6 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	 * this record.
 	 */
 	cipher->prev_seq = tcp_seqno + plen + ext_pgs->trail_len;
-
-	write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
-	    V_TCB_SND_NXT_RAW(M_TCB_SND_NXT_RAW) |
-	    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW),
-	    V_TCB_SND_NXT_RAW(0) | V_TCB_SND_UNA_RAW(0));
-	dst = txq_advance(txq, dst, EQ_ESIZE);
-	ndesc++;
-	txq->raw_wrs++;
-
-	write_set_tcb_field(toep, dst, W_TCB_SND_MAX_RAW,
-	    V_TCB_SND_MAX_RAW(M_TCB_SND_MAX_RAW), V_TCB_SND_MAX_RAW(0));
-	dst = txq_advance(txq, dst, EQ_ESIZE);
-	ndesc++;
-	txq->raw_wrs++;
 
 	if (first_wr || cipher->prev_ack != ntohl(tcp->th_ack)) {
 		write_set_tcb_field(toep, dst, W_TCB_RCV_NXT,
