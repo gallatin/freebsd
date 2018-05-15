@@ -2775,6 +2775,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
     struct mbuf *m, u_int nsegs, u_int available)
 {
 	struct sge_eq *eq = &txq->eq;
+	void *end, *start;
 	struct tx_sdesc *txsd;
 	struct tcphdr *tcp;
 	struct mbuf *m_tls;
@@ -2784,6 +2785,8 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	totdesc = 0;
 	tcp = (struct tcphdr *)(mtod(m, char *) + m->m_pkthdr.l2hlen +
 	    m->m_pkthdr.l3hlen);
+	start = &eq->desc[0];
+	end = &eq->desc[eq->sidx];
 
 	/*
 	 * Iterate over each TLS record constructing a work request
@@ -2807,7 +2810,14 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 		ndesc = sbtls_write_tls_wr(cipher, txq, dst, m, tcp, m_tls,
 		    nsegs, available - totdesc, tcp_seqno);
 		totdesc += ndesc;
-		dst = txq_advance(txq, dst, ndesc * EQ_ESIZE);
+
+		/*
+		 * NB: This does not use txq_advance() to handle a WR
+		 * that safely wrapped around the end of the ring.
+		 */
+		dst = (char *)dst + (ndesc * EQ_ESIZE);
+		if (dst >= end)
+			dst = (char *)start + ((char *)end - (char *)dst);
 
 		/*
 		 * The value of nsegs from the header mbuf's metadata
