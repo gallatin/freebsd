@@ -2275,7 +2275,12 @@ sbtls_base_wr_size(struct toepcb *toep)
 	wr_len += sizeof(struct ulp_txpkt);	// 8
 	wr_len += sizeof(struct ulptx_idata);	// 8
 	wr_len += sizeof(struct cpl_tx_sec_pdu);// 32
-	wr_len += key_size(toep);		// 16
+	if (toep->tls.key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
+		wr_len += toep->tls.k_ctx.tx_key_info_size;
+	else {
+		wr_len += sizeof(struct ulptx_sc_memrd);// 8
+		wr_len += sizeof(struct ulptx_idata);	// 8
+	}
 	wr_len += sizeof(struct cpl_tx_data);	// 16
 	return (wr_len);
 }
@@ -2544,6 +2549,7 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	struct toepcb *toep;
 	struct fw_ulptx_wr *wr;
 	struct ulp_txpkt *txpkt;
+	struct ulptx_sc_memrd *memrd;
 	struct ulptx_idata *idata;
 	struct cpl_tx_sec_pdu *sec_pdu;
 	struct cpl_tx_data *tx_data;
@@ -2642,8 +2648,18 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	idata = txq_advance(txq, txpkt, sizeof(*txpkt));
 	idata->cmd_more = htobe32(V_ULPTX_CMD(ULP_TX_SC_IMM) |
 	    V_ULP_TX_SC_MORE(1));
-	idata->len = htobe32(sizeof(struct cpl_tx_sec_pdu) + key_size(toep) +
-	    sizeof(struct cpl_tx_data) + imm_len);
+	idata->len = sizeof(struct cpl_tx_sec_pdu);
+
+	/*
+	 * The key context, CPL_TX_DATA, and TLS header are part of this
+	 * ULPTX_IDATA when using an inline key.  When reading the key
+	 * from memory, the CPL_TX_DATA and TLS header are part of a
+	 * separate ULPTX_IDATA.
+	 */
+	if (toep->tls.key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
+		idata->len += toep->tls.k_ctx.tx_key_info_size +
+		    sizeof(struct cpl_tx_data) + imm_len;
+	idata->len = htobe32(idata->len);
 
 	/* CPL_TX_SEC_PDU */
 	sec_pdu = txq_advance(txq, idata, sizeof(*idata));
@@ -2695,10 +2711,29 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 
 	/* Key context */
 	dst = txq_advance(txq, sec_pdu, sizeof(*sec_pdu));
-	tls_copy_tx_key(toep, dst);
+	if (toep->tls.key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE) {
+		memcpy(dst, &toep->tls.k_ctx.tx,
+		    toep->tls.k_ctx.tx_key_info_size);
+		dst = txq_advance(txq, dst, toep->tls.k_ctx.tx_key_info_size);
+	} else {
+		/* ULPTX_SC_MEMRD to read key context. */
+		memrd = dst;
+		memrd->cmd_to_len = htobe32(V_ULPTX_CMD(ULP_TX_SC_MEMRD) |
+		    V_ULP_TX_SC_MORE(1) |
+		    V_ULPTX_LEN16(toep->tls.k_ctx.tx_key_info_size >> 4));
+		memrd->addr = htobe32(toep->tls.tx_key_addr >> 5);
+
+		/* ULPTX_IDATA for CPL_TX_DATA and TLS header. */
+		idata = (void *)(memrd + 1);
+		idata->cmd_more = htobe32(V_ULPTX_CMD(ULP_TX_SC_IMM) |
+		    V_ULP_TX_SC_MORE(1));
+		idata->len = htobe32(sizeof(struct cpl_tx_data) + imm_len);
+
+		dst = txq_advance(txq, memrd, sizeof(*memrd) + sizeof(*idata));
+	}
 
 	/* CPL_TX_DATA */
-	tx_data = txq_advance(txq, dst, key_size(toep));
+	tx_data = dst;
 	OPCODE_TID(tx_data) = htonl(MK_OPCODE_TID(CPL_TX_DATA, toep->tid));
 	mss = toep->vi->ifp->if_mtu - (m->m_pkthdr.l3hlen + m->m_pkthdr.l4hlen);
 	tx_data->len = htobe32(V_TX_DATA_MSS(mss) |
