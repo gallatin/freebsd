@@ -2387,8 +2387,10 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		MPASS(m_tls->m_flags & M_NOMAP);
 
 		wr_len = sbtls_wr_len(cipher, m_tls, &nsegs);
+#ifdef VERBOSE_TRACES
 		CTR4(KTR_CXGBE, "%s: tid %d wr_len %d nsegs %d", __func__,
 		    cipher->toep->tid, wr_len, nsegs);
+#endif
 		if (wr_len > SGE_MAX_WR_LEN || nsegs > TX_SGL_SEGS)
 			return (EFBIG);
 		tot_len += wr_len;
@@ -2408,8 +2410,10 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	tot_len += 3 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
 	
 	*len16p = tot_len / 16;
+#ifdef VERBOSE_TRACES
 	CTR4(KTR_CXGBE, "%s: tid %d len16 %d nsegs %d", __func__,
 	    cipher->toep->tid, *len16p, *nsegsp);
+#endif
 	return (0);
 }
 
