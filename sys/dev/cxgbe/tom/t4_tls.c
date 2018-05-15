@@ -2800,9 +2800,16 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 		 * NB: This does not use txq_advance() to handle a WR
 		 * that safely wrapped around the end of the ring.
 		 */
+#ifdef VERBOSE_TRACES
+		CTR4(KTR_CXGBE, "%s: tid %d advance %p by %u desc", __func__,
+		    cipher->toep->tid, dst, ndesc);
+#endif
 		dst = (char *)dst + (ndesc * EQ_ESIZE);
 		if (dst >= end)
-			dst = (char *)start + ((char *)end - (char *)dst);
+			dst = (char *)start + ((char *)dst - (char *)end);
+		KASSERT(dst >= start && dst < end,
+		    ("%s: dst %p ndesc %u start %p end %p", __func__, dst,
+		    ndesc, start, end));
 
 		/*
 		 * The value of nsegs from the header mbuf's metadata
