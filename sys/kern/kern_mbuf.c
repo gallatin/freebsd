@@ -938,6 +938,7 @@ mb_extpgs_deferred_free(void *context, int pending)
 
 	mtx_lock(&extpgs_free_lock);
 	while (!STAILQ_EMPTY(&extpgs_free_list)) {
+		STAILQ_INIT(&head);
 		STAILQ_CONCAT(&head, &extpgs_free_list);
 		mtx_unlock(&extpgs_free_lock);
 
