@@ -1755,7 +1755,6 @@ send_sbtls_act_open_req(struct adapter *sc, struct vi_info *vi,
 	inp_4tuple_get(inp, &cpl->local_ip, &cpl->local_port,
 	    &cpl->peer_ip, &cpl->peer_port);
 
-	CTR2(KTR_CXGBE, "%s: MTU index %d", __func__, mtu_idx);
 	options = F_TCAM_BYPASS | V_MSS_IDX(mtu_idx) |
 	    V_ULP_MODE(ULP_MODE_NONE);
 	options |= V_L2T_IDX(toep->l2te->idx);
@@ -2392,17 +2391,14 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		    cipher->toep->tid, wr_len, nsegs);
 		if (wr_len > SGE_MAX_WR_LEN || nsegs > TX_SGL_SEGS)
 			return (EFBIG);
+		tot_len += wr_len;
 
 		/*
 		 * Store 'nsegs' for the first TLS record in the
 		 * header mbuf's metadata.
 		 */
-		if (*nsegsp == 0) {
-			CTR3(KTR_CXGBE, "%s: tid %d nsegs %d", __func__,
-			    cipher->toep->tid, nsegs);
+		if (*nsegsp == 0)
 			*nsegsp = nsegs;
-		}
-		tot_len += wr_len;
 	}
 
 	/*
@@ -2412,8 +2408,8 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	tot_len += 3 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
 	
 	*len16p = tot_len / 16;
-	CTR3(KTR_CXGBE, "%s: tid %d len16 %d", __func__,
-	    cipher->toep->tid, *len16p);
+	CTR4(KTR_CXGBE, "%s: tid %d len16 %d nsegs %d", __func__,
+	    cipher->toep->tid, *len16p, *nsegsp);
 	return (0);
 }
 
@@ -2572,16 +2568,12 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	if (first_wr || cipher->prev_seq != tcp_seqno) {
 		KASSERT(nsegs != 0,
 		    ("trying to set TX_MAX for subsequent TLS WR"));
-		if (!first_wr)
-			printf("%s: prev_seq %u current seq %u\n", __func__,
-			    cipher->prev_seq, tcp_seqno);
 		write_set_tcb_field(toep, dst, W_TCB_TX_MAX,
 		    V_TCB_TX_MAX(M_TCB_TX_MAX), V_TCB_TX_MAX(tcp_seqno));
 		dst = txq_advance(txq, dst, EQ_ESIZE);
 		ndesc++;
 		txq->raw_wrs++;
-	} else
-		printf("%s: skipped TX_MAX\n", __func__);
+	}
 
 	/*
 	 * Store the expected sequence number of the next byte after
@@ -2599,8 +2591,7 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 		ndesc++;
 		txq->raw_wrs++;
 		cipher->prev_ack = ntohl(tcp->th_ack);
-	} else
-		printf("%s: skipped RCV_NXT\n", __func__);
+	}
 
 	if (first_wr || cipher->prev_win != ntohs(tcp->th_win)) {
 		KASSERT(nsegs != 0,
@@ -2612,8 +2603,7 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 		ndesc++;
 		txq->raw_wrs++;
 		cipher->prev_win = ntohs(tcp->th_win);
-	} else
-		printf("%s: skipped RCV_WND\n", __func__);
+	}
 
 	/* Recalculate 'nsegs' if cached value is not available. */
 	if (nsegs == 0)
