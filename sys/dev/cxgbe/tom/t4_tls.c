@@ -2570,6 +2570,8 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 
 	/* Update TCB fields. */
 	if (first_wr || cipher->prev_seq != tcp_seqno) {
+		KASSERT(nsegs != 0,
+		    ("trying to set TX_MAX for subsequent TLS WR"));
 		if (!first_wr)
 			printf("%s: prev_seq %u current seq %u\n", __func__,
 			    cipher->prev_seq, tcp_seqno);
@@ -2588,6 +2590,8 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	cipher->prev_seq = tcp_seqno + plen + ext_pgs->trail_len;
 
 	if (first_wr || cipher->prev_ack != ntohl(tcp->th_ack)) {
+		KASSERT(nsegs != 0,
+		    ("trying to set RCV_NXT for subsequent TLS WR"));
 		write_set_tcb_field(toep, dst, W_TCB_RCV_NXT,
 		    V_TCB_RCV_NXT(M_TCB_RCV_NXT),
 		    V_TCB_RCV_NXT(ntohl(tcp->th_ack)));
@@ -2599,6 +2603,8 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 		printf("%s: skipped RCV_NXT\n", __func__);
 
 	if (first_wr || cipher->prev_win != ntohs(tcp->th_win)) {
+		KASSERT(nsegs != 0,
+		    ("trying to set RCV_WND for subsequent TLS WR"));
 		write_set_tcb_field(toep, dst, W_TCB_RCV_WND,
 		    V_TCB_RCV_WND(M_TCB_RCV_WND),
 		    V_TCB_RCV_WND(ntohs(tcp->th_win)));
