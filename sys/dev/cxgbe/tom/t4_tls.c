@@ -2037,13 +2037,6 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	if (error)
 		goto failed;
 
-#ifdef notsure
-	error = sbtls_set_tcb_field(toep, txq, W_TCB_TX_MAX,
-	    V_TCB_TX_MAX(M_TCB_TX_MAX), 0);
-	if (error)
-		goto failed;
-#endif
-
 	/*
 	 * Preallocate a work request mbuf to hold the work request
 	 * that programs the transmit key.  The work request isn't
