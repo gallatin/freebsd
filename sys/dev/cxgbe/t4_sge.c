@@ -3849,9 +3849,9 @@ alloc_txq(struct vi_info *vi, struct sge_txq *txq, int idx,
 	    CTLFLAG_RD, &txq->txpkts1_pkts,
 	    "# of frames tx'd using type1 txpkts work requests");
 	SYSCTL_ADD_UQUAD(&vi->ctx, children, OID_AUTO, "tls_wrs", CTLFLAG_RD,
-	    &txq->txpkt_wrs, "# of TLS work requests (TLS records)");
+	    &txq->tls_wrs, "# of TLS work requests (TLS records)");
 	SYSCTL_ADD_UQUAD(&vi->ctx, children, OID_AUTO, "raw_wrs", CTLFLAG_RD,
-	    &txq->txpkt_wrs, "# of raw work requests (non-packets)");
+	    &txq->raw_wrs, "# of raw work requests (non-packets)");
 
 	SYSCTL_ADD_COUNTER_U64(&vi->ctx, children, OID_AUTO, "r_enqueues",
 	    CTLFLAG_RD, &txq->r->enqueues,
