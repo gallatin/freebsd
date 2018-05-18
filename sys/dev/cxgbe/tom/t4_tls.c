@@ -2413,7 +2413,7 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 	 * the first TLS work request.
 	 */
 	tot_len += 3 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
-	
+
 	*len16p = tot_len / 16;
 #ifdef VERBOSE_TRACES
 	CTR4(KTR_CXGBE, "%s: tid %d len16 %d nsegs %d", __func__,
@@ -2856,7 +2856,7 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 		 */
 		nsegs = 0;
 	}
-	
+
 	MPASS(totdesc <= available);
 
 	txsd = &txq->sdesc[eq->pidx];
