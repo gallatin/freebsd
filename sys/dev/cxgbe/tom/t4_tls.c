@@ -2071,6 +2071,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	k_ctx = &tls_ofld->k_ctx;
 	init_sbtls_k_ctx(k_ctx, en, tls);
 
+	/* The SCMD fields used when encrypting a full TLS record. */
 	tls_ofld->scmd0.seqno_numivs = htobe32(V_SCMD_SEQ_NO_CTRL(3) |
 	    V_SCMD_PROTO_VERSION(get_proto_ver(k_ctx->proto_ver)) |
 	    V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
@@ -2087,6 +2088,35 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 	else
 		tls_ofld->scmd0.ivgen_hdrlen |= V_SCMD_KEY_CTX_INLINE(1);
 	tls_ofld->scmd0.ivgen_hdrlen = htobe32(tls_ofld->scmd0.ivgen_hdrlen);
+
+	/*
+	 * The SCMD fields used when encrypting a partial TLS record
+	 * (no trailer and possibly a truncated payload).
+	 */
+	tls_ofld->scmd0_short.seqno_numivs = V_SCMD_SEQ_NO_CTRL(0) |
+	    V_SCMD_PROTO_VERSION(SCMD_PROTO_VERSION_GENERIC) |
+	    V_SCMD_ENC_DEC_CTRL(SCMD_ENCDECCTRL_ENCRYPT) |
+	    V_SCMD_CIPH_AUTH_SEQ_CTRL((k_ctx->mac_first == 0)) |
+	    V_SCMD_AUTH_MODE(SCMD_AUTH_MODE_NOP) |
+	    V_SCMD_HMAC_CTRL(SCMD_HMAC_CTRL_NOP) |
+	    V_SCMD_IV_SIZE(CIPHER_BLOCK_SIZE / 2) | V_SCMD_NUM_IVS(0);
+	if (k_ctx->state.enc_mode == CH_EVP_CIPH_GCM_MODE)
+		tls_ofld->scmd0_short.seqno_numivs |=
+		    V_SCMD_CIPH_MODE(SCMD_CIPH_MODE_AES_CTR);
+	else
+		tls_ofld->scmd0_short.seqno_numivs |=
+		    V_SCMD_CIPH_MODE(k_ctx->state.enc_mode);
+	tls_ofld->scmd0_short.seqno_numivs =
+	    htobe32(tls_ofld->scmd0_short.seqno_numivs);
+
+	tls_ofld->scmd0_short.ivgen_hdrlen =
+	    V_SCMD_IV_GEN_CTRL(k_ctx->iv_ctrl) |
+	    V_SCMD_TLS_FRAG_ENABLE(0) |
+	    V_SCMD_AADIVDROP(1);
+	if (tls_ofld->key_location == TLS_SFO_WR_CONTEXTLOC_DDR)
+		tls_ofld->scmd0_short.ivgen_hdrlen |= V_SCMD_KEY_CTX_INLINE(0);
+	else
+		tls_ofld->scmd0_short.ivgen_hdrlen |= V_SCMD_KEY_CTX_INLINE(1);
 
 	tls_ofld->mac_length = k_ctx->mac_secret_size;
 
@@ -2105,7 +2135,7 @@ t6_sbtls_try(struct socket *so, struct tls_so_enable *en, int *errorp)
 		    CIPHER_BLOCK_SIZE;
 		/* XXX: Padding */
 		tls->sb_params.sb_tls_tlen = tls_ofld->mac_length;
-		tls->sb_params.sb_tls_bs = /* XXX */;
+		tls->sb_params.sb_tls_bs = CIPHER_BLOCK_SIZE;
 #endif
 	}
 	tls->t_type = SBTLS_T_TYPE_CHELSIO;
@@ -2285,6 +2315,56 @@ sbtls_base_wr_size(struct toepcb *toep)
 	return (wr_len);
 }
 
+/* How many bytes of TCP payload to send for a given TLS record. */
+static u_int
+sbtls_tcp_payload_length(struct t6_sbtls_cipher *cipher, struct mbuf *m_tls)
+{
+	struct mbuf_ext_pgs *ext_pgs;
+	struct tls_record_layer *hdr;
+	u_int plen, mlen;
+	
+	MBUF_EXT_PGS_ASSERT(m_tls);
+	ext_pgs = (void *)m_tls->m_ext.ext_buf;
+	hdr = (void *)ext_pgs->hdr;
+	plen = ntohs(hdr->tls_length);
+
+	/*
+	 * What range of the TLS record is the mbuf requesting to be
+	 * sent.
+	 */
+	mlen = mtod(m_tls, vm_offset_t) + m_tls->m_len;
+
+	/* Always send complete records. */
+	if (mlen == ext_pgs->hdr_len + plen + ext_pgs->trail_len)
+		return (mlen);
+
+	/*
+	 * If the host stack has asked to send part of the trailer,
+	 * trim the length to avoid sending any of the trailer.  There
+	 * is no way to send a partial trailer currently.
+	 */
+	if (mlen > ext_pgs->hdr_len + plen)
+		mlen = ext_pgs->hdr_len + plen;
+
+	/*
+	 * TODO: For AES-CBC we will want to adjust the ciphertext
+	 * length for the block size.
+	 */
+
+	/*
+	 * If the host stack has asked to only send the header or
+	 * less, don't send anything.  Eventually the stack should
+	 * ask to send more at which point we will send actual data.
+	 */
+	if (mlen <= ext_pgs->hdr_len)
+		return (0);
+
+	CTR4(KTR_CXGBE, "%s: tid %d short TLS record (%u vs %u)",
+	    __func__, cipher->toep->tid, mlen, ext_pgs->hdr_len + plen +
+	    ext_pgs->trail_len);
+	return (mlen);
+}
+
 static u_int
 sbtls_sgl_size(u_int nsegs)
 {
@@ -2303,25 +2383,37 @@ sbtls_wr_len(struct t6_sbtls_cipher *cipher, struct mbuf *m_tls, int *nsegsp)
 {
 	struct mbuf_ext_pgs *ext_pgs;
 	struct tls_record_layer *hdr;
-	u_int plen, wr_len;
+	u_int imm_len, plen, wr_len, tlen;
 
 	/*
-	 * Determine the size of the entire TLS record payload
-	 * excluding the trailer.
+	 * Determine the size of the TLS record payload to send
+	 * excluding header and trailer.
 	 */
+	tlen = sbtls_tcp_payload_length(cipher, m_tls);
+	if (tlen == 0)
+		return (0);
 	MBUF_EXT_PGS_ASSERT(m_tls);
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	hdr = (void *)ext_pgs->hdr;
-	plen = ntohs(hdr->tls_length);
+	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
+	if (plen < tlen)
+		plen = tlen;
 
 	/* Calculate the size of the work request. */
 	wr_len = sbtls_base_wr_size(cipher->toep);
 
-	/* TLS header as immediate data, padded to 16 bytes. */
-	wr_len += roundup2(ext_pgs->hdr_len, 16);
+	/*
+	 * TLS header as immediate data followed by a raw AES IV
+	 * if this is a "short" TLS record.
+	 */
+	imm_len = ext_pgs->hdr_len;
+	if (plen == tlen)
+		imm_len += CIPHER_BLOCK_SIZE;
+	wr_len += roundup2(imm_len, 16);
 
 	/* TLS record payload via DSGL. */
-	*nsegsp = sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len, plen);
+	*nsegsp = sglist_count_ext_pgs(ext_pgs, ext_pgs->hdr_len,
+	    plen - ext_pgs->hdr_len);
 	wr_len += sbtls_sgl_size(*nsegsp);
 
 	wr_len = roundup2(wr_len, 16);
@@ -2396,6 +2488,8 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		CTR4(KTR_CXGBE, "%s: tid %d wr_len %d nsegs %d", __func__,
 		    cipher->toep->tid, wr_len, nsegs);
 #endif
+		if (wr_len == 0)
+			break;
 		if (wr_len > SGE_MAX_WR_LEN || nsegs > TX_SGL_SEGS)
 			return (EFBIG);
 		tot_len += wr_len;
@@ -2407,6 +2501,9 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		if (*nsegsp == 0)
 			*nsegsp = nsegs;
 	}
+
+	if (tot_len == 0)
+		return (EAGAIN);
 
 	/*
 	 * Include room for up to 3 CPL_SET_TCB_FIELD requests before
@@ -2555,10 +2652,12 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	struct cpl_tx_data *tx_data;
 	struct mbuf_ext_pgs *ext_pgs;
 	struct tls_record_layer *hdr, *inhdr;
+	char *iv;
 	u_int aad_start, aad_stop;
 	u_int auth_start, auth_stop, auth_insert;
-	u_int cipher_start, cipher_stop;
-	u_int imm_len, mss, ndesc, plen, wr_len;
+	u_int cipher_start, cipher_stop, iv_offset;
+	u_int imm_len, mss, ndesc, plen, tlen, wr_len;
+	u_int real_tls_hdr_len;
 	bool first_wr;
 
 	ndesc = 0;
@@ -2573,6 +2672,14 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	inhdr = (void *)ext_pgs->hdr;
 	plen = ext_pgs->hdr_len + ntohs(inhdr->tls_length);
+	real_tls_hdr_len = plen + ext_pgs->trail_len - TLS_HEADER_LENGTH;
+
+	/* Determine how much of the TLS record to send. */
+	tlen = sbtls_tcp_payload_length(cipher, m_tls);
+	if (tlen == 0)
+		return (0);
+	if (tlen < plen)
+		plen = tlen;
 
 	/* Update TCB fields. */
 	if (first_wr || cipher->prev_seq != tcp_seqno) {
@@ -2589,7 +2696,7 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	 * Store the expected sequence number of the next byte after
 	 * this record.
 	 */
-	cipher->prev_seq = tcp_seqno + plen + ext_pgs->trail_len;
+	cipher->prev_seq = tcp_seqno + tlen;
 
 	if (first_wr || cipher->prev_ack != ntohl(tcp->th_ack)) {
 		KASSERT(nsegs != 0,
@@ -2624,6 +2731,8 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	wr_len = sbtls_base_wr_size(cipher->toep);
 
 	imm_len = ext_pgs->hdr_len;
+	if (plen == tlen)
+		imm_len += CIPHER_BLOCK_SIZE;
 	wr_len += roundup2(imm_len, 16);
 	wr_len += sbtls_sgl_size(nsegs);
 	wr_len = roundup2(wr_len, 16);
@@ -2651,10 +2760,10 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	idata->len = sizeof(struct cpl_tx_sec_pdu);
 
 	/*
-	 * The key context, CPL_TX_DATA, and TLS header are part of this
-	 * ULPTX_IDATA when using an inline key.  When reading the key
-	 * from memory, the CPL_TX_DATA and TLS header are part of a
-	 * separate ULPTX_IDATA.
+	 * The key context, CPL_TX_DATA, and immediate data are part
+	 * of this ULPTX_IDATA when using an inline key.  When reading
+	 * the key from memory, the CPL_TX_DATA and immediate data are
+	 * part of a separate ULPTX_IDATA.
 	 */
 	if (toep->tls.key_location == TLS_SFO_WR_CONTEXTLOC_IMMEDIATE)
 		idata->len += toep->tls.k_ctx.tx_key_info_size +
@@ -2663,34 +2772,62 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 
 	/* CPL_TX_SEC_PDU */
 	sec_pdu = txq_advance(txq, idata, sizeof(*idata));
+
+	/*
+	 * For short records, AAD is counted as header data in SCMD0,
+	 * the IV is next followed by a cipher region for the payload.
+	 */
+	if (plen == tlen) {
+		aad_start = 0;
+		aad_stop = 0;
+		iv_offset = 1;
+		auth_start = 0;
+		auth_stop = 0;
+		auth_insert = 0;
+		cipher_start = CIPHER_BLOCK_SIZE + 1;
+		cipher_stop = 0;
+		
+		sec_pdu->pldlen = htobe32(16 + plen - ext_pgs->hdr_len);
+
+		/* These two flits are actually a CPL_TLS_TX_SCMD_FMT. */
+		sec_pdu->seqno_numivs = toep->tls.scmd0_short.seqno_numivs;
+		sec_pdu->ivgen_hdrlen = htobe32(
+		    toep->tls.scmd0_short.ivgen_hdrlen |
+		    V_SCMD_HDR_LEN(ext_pgs->hdr_len));
+	} else {
+		/*
+		 * AAD is TLS header.  IV is after AAD.  The cipher region
+		 * starts after the IV.  See comments in ccr_authenc() and
+		 * ccr_gmac() in t4_crypto.c regarding cipher and auth
+		 * start/stop values.
+		 */
+		aad_start = 1;
+		aad_stop = TLS_HEADER_LENGTH;
+		iv_offset = TLS_HEADER_LENGTH + 1;
+		cipher_start = ext_pgs->hdr_len + 1;
+		if (toep->tls.k_ctx.state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
+			cipher_stop = 0;
+			auth_start = cipher_start;
+			auth_stop = 0;
+			auth_insert = 0;
+		} else {
+			/* XXX: This might not be quite right due to padding. */
+			cipher_stop = 0;
+			auth_start = cipher_start;
+			auth_stop = cipher_stop;
+			auth_insert = 0;
+		}
+
+		sec_pdu->pldlen = htobe32(plen);
+
+		/* These two flits are actually a CPL_TLS_TX_SCMD_FMT. */
+		sec_pdu->seqno_numivs = toep->tls.scmd0.seqno_numivs;
+		sec_pdu->ivgen_hdrlen = toep->tls.scmd0.ivgen_hdrlen;
+	}
 	sec_pdu->op_ivinsrtofst = htobe32(
 	    V_CPL_TX_SEC_PDU_OPCODE(CPL_TX_SEC_PDU) |
 	    V_CPL_TX_SEC_PDU_CPLLEN(2) | V_CPL_TX_SEC_PDU_PLACEHOLDER(0) |
-	    V_CPL_TX_SEC_PDU_IVINSRTOFST(TLS_HEADER_LENGTH + 1));
-
-	sec_pdu->pldlen = htobe32(plen);
-
-	/*
-	 * AAD is TLS header.  IV is after AAD.  The cipher region
-	 * starts after the IV.  See comments in ccr_authenc() and
-	 * ccr_gmac() in t4_crypto.c regarding cipher and auth
-	 * start/stop values.
-	 */
-	aad_start = 1;
-	aad_stop = TLS_HEADER_LENGTH;
-	cipher_start = ext_pgs->hdr_len + 1;
-	if (toep->tls.k_ctx.state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
-		cipher_stop = 0;
-		auth_start = cipher_start;
-		auth_stop = 0;
-		auth_insert = 0;
-	} else {
-		/* XXX: This might not be quite right due to padding. */
-		cipher_stop = 0;
-		auth_start = cipher_start;
-		auth_stop = cipher_stop;
-		auth_insert = 0;
-	}
+	    V_CPL_TX_SEC_PDU_IVINSRTOFST(iv_offset));
 	sec_pdu->aadstart_cipherstop_hi = htobe32(
 	    V_CPL_TX_SEC_PDU_AADSTART(aad_start) |
 	    V_CPL_TX_SEC_PDU_AADSTOP(aad_stop) |
@@ -2701,10 +2838,6 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	    V_CPL_TX_SEC_PDU_AUTHSTART(auth_start) |
 	    V_CPL_TX_SEC_PDU_AUTHSTOP(auth_stop) |
 	    V_CPL_TX_SEC_PDU_AUTHINSERT(auth_insert));
-
-	/* These two flits are actually a CPL_TLS_TX_SCMD_FMT. */
-	sec_pdu->seqno_numivs = toep->tls.scmd0.seqno_numivs;
-	sec_pdu->ivgen_hdrlen = toep->tls.scmd0.ivgen_hdrlen;
 
 	/* XXX: Ok to reuse TLS sequence number? */
 	sec_pdu->scmd1 = htobe64(ext_pgs->seqno);
@@ -2736,8 +2869,7 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	tx_data = dst;
 	OPCODE_TID(tx_data) = htonl(MK_OPCODE_TID(CPL_TX_DATA, toep->tid));
 	mss = toep->vi->ifp->if_mtu - (m->m_pkthdr.l3hlen + m->m_pkthdr.l4hlen);
-	tx_data->len = htobe32(V_TX_DATA_MSS(mss) |
-	    V_TX_LENGTH(plen + ext_pgs->trail_len));
+	tx_data->len = htobe32(V_TX_DATA_MSS(mss) | V_TX_LENGTH(tlen));
 	tx_data->rsvd = htobe32(tcp_seqno);
 	tx_data->flags = htobe32(F_TX_BYPASS);
 
@@ -2746,8 +2878,43 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	hdr->tls_type = inhdr->tls_type;
 	hdr->tls_vmajor = inhdr->tls_vmajor;
 	hdr->tls_vminor = inhdr->tls_vminor;
-	hdr->tls_length = htons(plen + ext_pgs->trail_len - TLS_HEADER_LENGTH);
-	*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
+	hdr->tls_length = htons(real_tls_hdr_len);
+	if (toep->tls.k_ctx.state.enc_mode == CH_EVP_CIPH_GCM_MODE)
+		*(uint64_t *)(hdr + 1) = htobe64(ext_pgs->seqno);
+#ifdef notyet
+	else
+		/* XXX: Have to generate and append IV here. */
+		/*
+		 * XXX: This is fraught with peril for retransmits as
+		 * we need to always use the same IV for the same TLS
+		 * record.  Probably for CBC the IV will need to be
+		 * generated when the TLS record is created at the
+		 * socket layer.
+		 */
+		XXX;
+#endif
+
+	/* AES IV for a short record. */
+	if (plen == tlen) {
+		iv = (char *)hdr + ext_pgs->hdr_len;
+		if (toep->tls.k_ctx.state.enc_mode == CH_EVP_CIPH_GCM_MODE) {
+			if (toep->tls.key_location ==
+			    TLS_SFO_WR_CONTEXTLOC_IMMEDIATE) {
+				struct tx_keyctx_hdr *khdr;
+
+				khdr = (void *)&toep->tls.k_ctx.tx;
+				memcpy(iv, khdr->txsalt, SALT_SIZE);
+			} else
+				memcpy(iv, toep->tls.k_ctx.tx.salt, SALT_SIZE);
+			*(uint64_t *)(iv + 4) = htobe64(ext_pgs->seqno);
+			memset(iv + 12, 0, 3);
+			iv[15] = 2;
+		}
+#ifdef notyet
+		else
+			XXX;
+#endif
+	}
 
 	/* SGL for record payload */
 	dst = txq_advance(txq, hdr, roundup2(imm_len, 16));
