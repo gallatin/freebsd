@@ -1975,26 +1975,6 @@ set_mbuf_nsegs(struct mbuf *m, uint8_t nsegs)
 }
 
 static inline int
-mbuf_len16(struct mbuf *m)
-{
-	int n;
-
-	M_ASSERTPKTHDR(m);
-	n = m->m_pkthdr.PH_loc.eight[0];
-	MPASS(n > 0 && n <= SGE_MAX_WR_LEN / 16);
-
-	return (n);
-}
-
-static inline void
-set_mbuf_len16(struct mbuf *m, uint8_t len16)
-{
-
-	M_ASSERTPKTHDR(m);
-	m->m_pkthdr.PH_loc.eight[0] = len16;
-}
-
-static inline int
 mbuf_cflags(struct mbuf *m)
 {
 
@@ -2008,6 +1988,27 @@ set_mbuf_cflags(struct mbuf *m, uint8_t flags)
 
 	M_ASSERTPKTHDR(m);
 	m->m_pkthdr.PH_loc.eight[1] = flags;
+}
+
+static inline int
+mbuf_len16(struct mbuf *m)
+{
+	int n;
+
+	M_ASSERTPKTHDR(m);
+	n = m->m_pkthdr.PH_loc.eight[0];
+	if (!(mbuf_cflags(m) & MC_TLS))
+		MPASS(n > 0 && n <= SGE_MAX_WR_LEN / 16);
+
+	return (n);
+}
+
+static inline void
+set_mbuf_len16(struct mbuf *m, uint8_t len16)
+{
+
+	M_ASSERTPKTHDR(m);
+	m->m_pkthdr.PH_loc.eight[0] = len16;
 }
 
 /*
