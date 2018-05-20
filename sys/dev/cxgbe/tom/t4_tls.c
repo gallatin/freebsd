@@ -2641,8 +2641,10 @@ _Static_assert(W_TCB_SND_UNA_RAW == W_TCB_SND_NXT_RAW,
 static int
 sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
     void *dst, struct mbuf *m, struct tcphdr *tcp, struct mbuf *m_tls,
-    u_int nsegs, u_int available, tcp_seq tcp_seqno)
+    u_int nsegs, u_int available, tcp_seq tcp_seqno, u_int pidx)
 {
+	struct sge_eq *eq = &txq->eq;
+	struct tx_sdesc *txsd;
 	struct toepcb *toep;
 	struct fw_ulptx_wr *wr;
 	struct ulp_txpkt *txpkt;
@@ -2690,6 +2692,10 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 		dst = txq_advance(txq, dst, EQ_ESIZE);
 		ndesc++;
 		txq->raw_wrs++;
+		txsd = &txq->sdesc[pidx];
+		txsd->m = NULL;
+		txsd->desc_used = 1;
+		IDXINCR(pidx, 1, eq->sidx);
 	}
 
 	/*
@@ -2707,6 +2713,11 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 		dst = txq_advance(txq, dst, EQ_ESIZE);
 		ndesc++;
 		txq->raw_wrs++;
+		txsd = &txq->sdesc[pidx];
+		txsd->m = NULL;
+		txsd->desc_used = 1;
+		IDXINCR(pidx, 1, eq->sidx);
+
 		cipher->prev_ack = ntohl(tcp->th_ack);
 	}
 
@@ -2719,6 +2730,11 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 		dst = txq_advance(txq, dst, EQ_ESIZE);
 		ndesc++;
 		txq->raw_wrs++;
+		txsd = &txq->sdesc[pidx];
+		txsd->m = NULL;
+		txsd->desc_used = 1;
+		IDXINCR(pidx, 1, eq->sidx);
+
 		cipher->prev_win = ntohs(tcp->th_win);
 	}
 
@@ -2958,6 +2974,13 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	MPASS(ndesc <= available);
 	txq->tls_wrs++;
 
+	txsd = &txq->sdesc[pidx];
+	if (m_tls->m_next == NULL)
+		txsd->m = m;
+	else
+		txsd->m = NULL;
+	txsd->desc_used = howmany(wr_len, EQ_ESIZE);
+
 	return (ndesc);
 }
 
@@ -2967,17 +2990,17 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 {
 	struct sge_eq *eq = &txq->eq;
 	void *end, *start;
-	struct tx_sdesc *txsd;
 	struct tcphdr *tcp;
 	struct mbuf *m_tls;
 	tcp_seq tcp_seqno;
-	u_int ndesc, totdesc;
+	u_int ndesc, pidx, totdesc;
 
 	totdesc = 0;
 	tcp = (struct tcphdr *)(mtod(m, char *) + m->m_pkthdr.l2hlen +
 	    m->m_pkthdr.l3hlen);
 	start = &eq->desc[0];
 	end = &eq->desc[eq->sidx];
+	pidx = eq->pidx;
 
 	/*
 	 * Iterate over each TLS record constructing a work request
@@ -2999,8 +3022,9 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 		}
 
 		ndesc = sbtls_write_tls_wr(cipher, txq, dst, m, tcp, m_tls,
-		    nsegs, available - totdesc, tcp_seqno);
+		    nsegs, available - totdesc, tcp_seqno, pidx);
 		totdesc += ndesc;
+		IDXINCR(pidx, ndesc, eq->sidx);
 
 		/*
 		 * NB: This does not use txq_advance() to handle a WR
@@ -3025,11 +3049,6 @@ sbtls_write_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq, void *dst,
 	}
 
 	MPASS(totdesc <= available);
-
-	txsd = &txq->sdesc[eq->pidx];
-	txsd->m = m;
-	txsd->desc_used = totdesc;
-
 	return (totdesc);
 }
 
