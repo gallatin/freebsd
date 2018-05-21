@@ -2584,7 +2584,8 @@ eth_tx(struct mp_ring *r, u_int cidx, u_int pidx)
 		M_ASSERTPKTHDR(m0);
 		MPASS(m0->m_nextpkt == NULL);
 
-		if (available < SGE_MAX_WR_NDESC) {
+		if (available < howmany(mbuf_len16(m0), EQ_ESIZE / 16)) {
+			MPASS(howmany(mbuf_len16(m0), EQ_ESIZE / 16) <= 64);
 			available += reclaim_tx_descs(txq, 64);
 			if (available < howmany(mbuf_len16(m0), EQ_ESIZE / 16))
 				break;	/* out of descriptors */
