@@ -37,6 +37,7 @@ __FBSDID("$FreeBSD$");
 #include "opt_inet.h"
 #include "opt_inet6.h"
 #include "opt_ipsec.h"
+#include "opt_kern_tls.h"
 #include "opt_tcpdebug.h"
 
 #include <sys/param.h>
@@ -53,6 +54,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/sdt.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
+#ifdef KERN_TLS
+#include <sys/sockbuf_tls.h>
+#endif
 #include <sys/sysctl.h>
 
 #include <net/if.h>
@@ -977,11 +981,13 @@ send:
 		 */
 		mb = sbsndptr(&so->so_snd, off, &moff);
 
+#ifdef KERN_TLS
 		/*
 		 * XXX: A gross hack to avoid mixing TLS records with
 		 * handshake data.
 		 */
-		if (!mbuf_is_ifnet_tls(mb)) {
+		if (so->so_snd.sb_tls_flags & SB_TLS_IFNET &&
+		    !(mb->m_flags & M_NOMAP)) {
 			struct mbuf *n;
 			u_int new_len;
 
@@ -1009,7 +1015,8 @@ send:
 		 * a TLS record, expand 'len' to cover the TLS record
 		 * if necessary.
 		 */
-		{
+		if (so->so_snd.sb_tls_flags & SB_TLS_IFNET &&
+		    mb->m_flags & M_NOMAP) {
 			struct mbuf *n;
 			u_int new_len;
 
@@ -1023,12 +1030,13 @@ send:
 						CTR3(KTR_SPARE3,
 					    "%s: advancing len from %u to %u",
 						    __func__, len, new_len);
-						//len = new_len;
+						len = new_len;
 					}
 					break;
 				}
 			}
 		}
+#endif
 #endif
 
 		if ((tp->t_flags & TF_FORCEDATA) && len == 1)
