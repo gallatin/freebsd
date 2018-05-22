@@ -2470,6 +2470,16 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 
 	/* XXX: Reject unsupported TCP options? */
 
+	/* Bail if there is TCP payload before the TLS record. */
+	if (m->m_len != m->m_pkthdr.l2hlen + m->m_pkthdr.l3hlen +
+	    m->m_pkthdr.l4hlen) {
+		CTR6(KTR_CXGBE,
+		    "%s: tid %d header mbuf bad length (%d + %d + %d != %d)",
+		    __func__, cipher->toep->tid, m->m_pkthdr.l2hlen,
+		    m->m_pkthdr.l3hlen, m->m_pkthdr.l4hlen, m->m_len);
+		return (EINVAL);
+	}
+
 	/* Assume all headers are in 'm' for now. */
 	MPASS(m->m_next != NULL);
 	MPASS(m->m_next->m_flags & M_NOMAP);
