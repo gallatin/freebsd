@@ -971,6 +971,66 @@ send:
 		struct mbuf *mb;
 		u_int moff;
 
+		/*
+		 * Start the m_copy functions from the closest mbuf
+		 * to the offset in the socket buffer chain.
+		 */
+		mb = sbsndptr(&so->so_snd, off, &moff);
+
+		/*
+		 * XXX: A gross hack to avoid mixing TLS records with
+		 * handshake data.
+		 */
+		if (!mbuf_is_ifnet_tls(mb)) {
+			struct mbuf *n;
+			u_int new_len;
+
+			new_len = mb->m_len - moff;
+			for (n = mb->m_next; new_len < len; n = n->m_next) {
+				if (mbuf_is_ifnet_tls(n))
+					break;
+				new_len += n->m_len;
+			}
+			if (new_len < len) {
+				/* XXX: KTR_CXGBE */
+				CTR3(KTR_SPARE3,
+				    "%s: truncating len from %u to %u",
+				    __func__, len, new_len);
+				len = new_len;
+			}
+		}
+
+#if 0
+		/*
+		 * XXX: A gross hack to force full TLS
+		 * records.
+		 *
+		 * Walk the mbuf chain for 'len' bytes and if there is
+		 * a TLS record, expand 'len' to cover the TLS record
+		 * if necessary.
+		 */
+		{
+			struct mbuf *n;
+			u_int new_len;
+
+			/* Find the last mbuf in 'len' bytes. */
+			new_len = mb->m_len - moff;
+			for (n = mb->m_next; new_len < len; n = n->m_next) {
+				new_len += n->m_len;
+				if (new_len > len) {
+					if (mbuf_is_ifnet_tls(n)) {
+						/* XXX: KTR_CXGBE */
+						CTR3(KTR_SPARE3,
+					    "%s: advancing len from %u to %u",
+						    __func__, len, new_len);
+						//len = new_len;
+					}
+					break;
+				}
+			}
+		}
+#endif
+
 		if ((tp->t_flags & TF_FORCEDATA) && len == 1)
 			TCPSTAT_INC(tcps_sndprobe);
 		else if (SEQ_LT(tp->snd_nxt, tp->snd_max) || sack_rxmit) {
@@ -998,11 +1058,6 @@ send:
 		m->m_data += max_linkhdr;
 		m->m_len = hdrlen;
 
-		/*
-		 * Start the m_copy functions from the closest mbuf
-		 * to the offset in the socket buffer chain.
-		 */
-		mb = sbsndptr(&so->so_snd, off, &moff);
 		if (SEQ_LT(tp->snd_nxt, tp->snd_max))
 			msb = NULL;
 		else
