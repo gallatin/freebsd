@@ -2396,7 +2396,7 @@ sbtls_wr_len(struct t6_sbtls_cipher *cipher, struct mbuf *m_tls, int *nsegsp)
 	ext_pgs = (void *)m_tls->m_ext.ext_buf;
 	hdr = (void *)ext_pgs->hdr;
 	plen = ext_pgs->hdr_len + ntohs(hdr->tls_length);
-	if (plen < tlen)
+	if (tlen < plen)
 		plen = tlen;
 
 	/* Calculate the size of the work request. */
