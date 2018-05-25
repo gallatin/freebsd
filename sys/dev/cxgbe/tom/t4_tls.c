@@ -2516,10 +2516,10 @@ sbtls_parse_pkt(struct t6_sbtls_cipher *cipher, struct mbuf *m, int *nsegsp,
 		return (EAGAIN);
 
 	/*
-	 * Include room for up to 3 CPL_SET_TCB_FIELD requests before
+	 * Include room for up to 4 CPL_SET_TCB_FIELD requests before
 	 * the first TLS work request.
 	 */
-	tot_len += 3 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
+	tot_len += 4 * roundup2(sizeof(struct cpl_set_tcb_field), 16);
 
 	*len16p = tot_len / 16;
 #ifdef VERBOSE_TRACES
@@ -2669,7 +2669,7 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	u_int auth_start, auth_stop, auth_insert;
 	u_int cipher_start, cipher_stop, iv_offset;
 	u_int imm_len, mss, ndesc, plen, tlen, wr_len;
-	u_int real_tls_hdr_len;
+	u_int real_tls_hdr_len, tx_max;
 	bool first_wr;
 
 	ndesc = 0;
@@ -2693,12 +2693,59 @@ sbtls_write_tls_wr(struct t6_sbtls_cipher *cipher, struct sge_txq *txq,
 	if (tlen < plen)
 		plen = tlen;
 
+	/*
+	 * The host stack may ask us to not send part of the start of
+	 * a TLS record.  (For example, the stack might have
+	 * previously sent a "short" TLS record and might later send
+	 * down an mbuf that requests to send the remainder of the TLS
+	 * record.)  The crypto engine must process a TLS record from
+	 * the beginning if computing a GCM tag or HMAC, so we always
+	 * send the TLS record from the beginning as input to the
+	 * crypto engine and via CPL_TX_DATA to TP.  However, TP will
+	 * drop individual packets after they have been chopped up
+	 * into MSS-sized chunks if the entire sequence range of those
+	 * packets is less than SND_UNA.  SND_UNA is computed as
+	 * TX_MAX - SND_UNA_RAW.  Thus, use the offset stored in
+	 * m_data to set TX_MAX to the first byte in the TCP sequence
+	 * space the host actually wants us to send and set
+	 * SND_UNA_RAW to 0.
+	 */
+	tx_max = tcp_seqno + mtod(m_tls, vm_offset_t);
+
 	/* Update TCB fields. */
-	if (first_wr || cipher->prev_seq != tcp_seqno) {
+	if (first_wr || cipher->prev_seq != tx_max) {
 		KASSERT(nsegs != 0,
 		    ("trying to set TX_MAX for subsequent TLS WR"));
+#ifdef VERBOSE_TRACES
+		CTR4(KTR_CXGBE,
+		    "%s: tid %d setting TX_MAX to %u (tcp_seqno %u)",
+		    __func__, toep->tid, tx_max, tcp_seqno);
+#endif
 		write_set_tcb_field(toep, dst, W_TCB_TX_MAX,
-		    V_TCB_TX_MAX(M_TCB_TX_MAX), V_TCB_TX_MAX(tcp_seqno));
+		    V_TCB_TX_MAX(M_TCB_TX_MAX), V_TCB_TX_MAX(tx_max));
+		dst = txq_advance(txq, dst, EQ_ESIZE);
+		ndesc++;
+		txq->raw_wrs++;
+		txsd = &txq->sdesc[pidx];
+		txsd->m = NULL;
+		txsd->desc_used = 1;
+		IDXINCR(pidx, 1, eq->sidx);
+	}
+
+	/*
+	 * If there is data to drop at the beginning of this TLS
+	 * record or if this is a retransmit,
+	 * reset SND_UNA_RAW to 0 so that SND_UNA == TX_MAX.
+	 */
+	if (cipher->prev_seq != tx_max || mtod(m_tls, vm_offset_t) != 0) {
+		KASSERT(nsegs != 0,
+		    ("trying to clear SND_UNA_RAW for subsequent TLS WR"));
+#ifdef VERBOSE_TRACES
+		CTR2(KTR_CXGBE, "%s: tid %d clearing SND_UNA_RAW", __func__,
+		    toep->tid);
+#endif
+		write_set_tcb_field(toep, dst, W_TCB_SND_UNA_RAW,
+		    V_TCB_SND_UNA_RAW(M_TCB_SND_UNA_RAW), V_TCB_SND_UNA_RAW(0));
 		dst = txq_advance(txq, dst, EQ_ESIZE);
 		ndesc++;
 		txq->raw_wrs++;
